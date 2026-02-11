@@ -1,0 +1,35 @@
+# Illuminate API Configuration Template for HMH Assessment Extraction
+# Copy this file to config.ini and fill in your actual credentials
+
+[api]
+# Your Illuminate API base URL (v2 API)
+# Example: https://yourdistrict.illuminateed.com/api/v2
+base_url = https://your-district.illuminateed.com/api/v2
+
+[oauth]
+# OAuth 1.0 credentials from Illuminate
+# Get these from: Settings (COG) > API Management in Illuminate
+consumer_key = your_consumer_key_here
+consumer_secret = your_consumer_secret_here
+access_token = your_access_token_here
+access_token_secret = your_access_token_secret_here
+
+[database]
+# SQL Server connection settings
+# Example server formats:
+#   - Local: localhost
+#   - Named instance: localhost\SQLEXPRESS
+#   - Remote: server.domain.com
+#   - With port: server.domain.com,1433
+server = your_sql_server_here
+
+# Database name (must exist before running - see hmh_schema.sql)
+database = HMH_AssessmentData
+
+# Authentication method
+# Set to true for Windows Authentication, false for SQL Server Authentication
+windows_auth = false
+
+# SQL Server Authentication (only needed if windows_auth = false)
+username = your_sql_username
+password = your_sql_password
