@@ -1,6 +1,6 @@
 # Illuminate Assessment Data Extractor
 
-Python-based extractor for pulling assessment data from Illuminate/Renaissance DnA API into SQL Server with automatic HMH program filtering.
+Python-based extractor for pulling standards-based assessment data from Illuminate/Renaissance DnA API into SQL Server with school enrichment.
 
 ## Overview
 
@@ -328,18 +328,33 @@ FROM Illuminate_Assessment_Results;
 
 ### Daily Incremental Loads
 
-```python
-from datetime import datetime, timedelta
+Use the incremental script for nightly updates:
 
-yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-today = datetime.now().strftime('%Y-%m-%d')
+```bash
+# Extract last 7 days (recommended for nightly runs)
+python illuminate_extractor_incremental.py
 
-extractor.extract_illuminate_assessment_data(
-    start_date=yesterday,
-    end_date=today,
-    academic_year='2024-2025'
-)
+# Extract last 1 day
+python illuminate_extractor_incremental.py 1
+
+# Extract last 3 days
+python illuminate_extractor_incremental.py 3
 ```
+
+**Schedule with cron (Linux/Mac):**
+```bash
+# Run every night at 2 AM
+0 2 * * * cd /path/to/Illuminate-Data-Extract && python3 illuminate_extractor_incremental.py >> nightly.log 2>&1
+```
+
+**Schedule with Windows Task Scheduler:**
+1. Open Task Scheduler
+2. Create Basic Task → "Illuminate Nightly Update"
+3. Trigger: Daily at 2:00 AM
+4. Action: Start program
+   - Program: `python.exe`
+   - Arguments: `illuminate_extractor_incremental.py`
+   - Start in: `C:\path\to\Illuminate-Data-Extract`
 
 ### Re-sync HMH Data
 

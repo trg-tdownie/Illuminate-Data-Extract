@@ -36,6 +36,10 @@ class IlluminateAPIExtractor:
         self.base_url = self.config.get('api', 'base_url')
         self.db_connection = None
         self.oauth = None
+        self.sites_cache = {}  # Cache for site/school information
+        self.students_cache = {}  # Cache for student information
+        self.users_cache = {}  # Cache for user/teacher information
+        self.roster_cache = {}  # Cache for student-teacher assignments
         self._setup_oauth()
 
     def _load_config(self, config_file: str) -> configparser.ConfigParser:
@@ -59,6 +63,148 @@ class IlluminateAPIExtractor:
             signature_type='auth_header'
         )
         logger.info("OAuth 1.0 authentication configured")
+
+    def _load_sites_cache(self):
+        """Load all sites/schools into cache for lookup"""
+        logger.info("Loading sites/schools into cache...")
+
+        sites_data = self._make_api_request('/Api/Sites')
+        if sites_data:
+            for site in sites_data:
+                site_id = site.get('site_id')
+                if site_id:
+                    self.sites_cache[str(site_id)] = {
+                        'site_name': site.get('site_name'),
+                        'state_school_id': site.get('state_school_id'),
+                        'local_site_code': site.get('local_site_code'),
+                        'city': site.get('city'),
+                        'state': site.get('state')
+                    }
+            logger.info(f"Loaded {len(self.sites_cache)} sites into cache")
+        else:
+            logger.warning("Failed to load sites cache")
+
+    def _load_students_cache(self):
+        """Load all students with enrollment/school info into cache for lookup"""
+        logger.info("Loading student enrollments with school info into cache...")
+        page = 1
+
+        while True:
+            params = {
+                'page': page,
+                'limit': 1000
+            }
+
+            # Use Enrollment endpoint which includes school information
+            enrollment_data = self._make_api_request('/Api/Enrollment/', params)
+            if not enrollment_data or 'results' not in enrollment_data:
+                break
+
+            results = enrollment_data['results']
+            if not results:
+                break
+
+            for enrollment in results:
+                # Try multiple ID fields to match assessment data
+                district_student_id = enrollment.get('district_student_id')
+                state_student_id = enrollment.get('state_student_id')
+                student_id = enrollment.get('student_id')
+
+                # Cache by district_student_id (which matches local_student_id in assessments)
+                if district_student_id:
+                    site_id = enrollment.get('site_id')
+                    self.students_cache[str(district_student_id)] = {
+                        'state_student_id': state_student_id,
+                        'student_id': student_id,
+                        'grade_level': enrollment.get('grade_level'),
+                        'site_id': str(site_id) if site_id else None,
+                        'site_name': enrollment.get('school'),  # Enrollment API returns 'school' field
+                        'district_name': enrollment.get('district')
+                    }
+
+            logger.info(f"Loaded page {page} of enrollments, total cached: {len(self.students_cache)}")
+
+            if page >= enrollment_data.get('num_pages', 1):
+                break
+
+            page += 1
+            time.sleep(0.2)  # Rate limiting
+
+        logger.info(f"Finished loading {len(self.students_cache)} student enrollments into cache")
+
+    def _load_users_cache(self):
+        """Load all users (teachers) into cache"""
+        logger.info("Loading users/teachers into cache...")
+        page = 1
+
+        while True:
+            params = {'page': page, 'limit': 1000}
+            data = self._make_api_request('/Api/Users/', params)
+
+            if not data or 'results' not in data:
+                break
+
+            results = data['results']
+            if not results:
+                break
+
+            for user in results:
+                user_id = user.get('user_id')
+                if user_id:
+                    self.users_cache[str(user_id)] = {
+                        'first_name': user.get('first_name'),
+                        'last_name': user.get('last_name'),
+                        'job_title': user.get('job_title')
+                    }
+
+            logger.info(f"Loaded page {page} of users, total cached: {len(self.users_cache)}")
+
+            if page >= data.get('num_pages', 1):
+                break
+
+            page += 1
+            time.sleep(0.2)
+
+        logger.info(f"Finished loading {len(self.users_cache)} users")
+
+    def _load_roster_cache(self):
+        """Load roster (student-to-teacher assignments) into cache"""
+        logger.info("Loading roster data (student-teacher assignments)...")
+        page = 1
+
+        while True:
+            params = {'page': page, 'limit': 1000}
+            data = self._make_api_request('/Api/Roster/', params)
+
+            if not data or 'results' not in data:
+                break
+
+            results = data['results']
+            if not results:
+                break
+
+            for record in results:
+                district_student_id = record.get('district_student_id')
+                if district_student_id:
+                    # Store by student ID - may have multiple sections, we'll use first one
+                    if str(district_student_id) not in self.roster_cache:
+                        self.roster_cache[str(district_student_id)] = {
+                            'user_id': str(record.get('user_id')),
+                            'grade_level_id': record.get('grade_level_id'),
+                            'section_id': record.get('section_id'),
+                            'site_id': record.get('site_id'),
+                            'course_id': record.get('course_id')
+                        }
+
+            logger.info(f"Loaded page {page} of roster, total cached: {len(self.roster_cache)}")
+
+            if page >= data.get('num_pages', 1):
+                break
+
+            page += 1
+            time.sleep(0.2)
+
+        logger.info(f"Finished loading {len(self.roster_cache)} student-teacher assignments")
 
     def connect_db(self):
         """Connect to SQL Server database"""
@@ -103,13 +249,27 @@ class IlluminateAPIExtractor:
 
     def _make_api_request(self, endpoint: str, params: Dict = None) -> Optional[Dict]:
         """Make an authenticated API request"""
+        # Remove leading slash from endpoint if present to avoid double slashes
+        endpoint = endpoint.lstrip('/')
         url = f"{self.base_url}/{endpoint}"
+
+        # Add consumer key to params as required by API
+        if params is None:
+            params = {}
+        params['consumerKey'] = self.config.get('oauth', 'consumer_key')
+
         try:
             response = requests.get(url, auth=self.oauth, params=params, timeout=30)
             logger.info(f"Request URL: {url}")
+            logger.info(f"Request Params: {params}")
             logger.info(f"Response Status: {response.status_code}")
             logger.info(f"Response Headers: {dict(response.headers)}")
             logger.info(f"Response Text (first 500 chars): {response.text[:500]}")
+
+            # If 401, log more details for debugging
+            if response.status_code == 401:
+                logger.error("Authentication failed - check OAuth credentials in config.ini")
+                logger.error("Ensure Consumer Key, Consumer Secret, Access Token, and Access Token Secret are correct")
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -595,28 +755,37 @@ class IlluminateAPIExtractor:
         total_extracted = 0
 
         try:
-            # Try primary endpoint for standards-based assessment data
-            logger.info("Attempting to extract from students/assessment_standards endpoint...")
-            count = self._extract_illuminate_from_standards_endpoint(
+            # Test API connection
+            logger.info("Testing API connection with /Api/Sites endpoint...")
+            test_data = self._make_api_request('/Api/Sites')
+            if test_data:
+                logger.info(f"API connection successful! Found {len(test_data)} sites")
+            else:
+                logger.error("API connection failed!")
+                return 0
+
+            # Load reference data into cache for school names, teachers, and roster
+            logger.info("\n" + "=" * 60)
+            logger.info("Loading reference data (sites, students, teachers, and roster)...")
+            logger.info("=" * 60)
+            self._load_sites_cache()
+            self._load_students_cache()
+            self._load_users_cache()
+            self._load_roster_cache()
+
+            # Extract from the correct standards-based endpoint
+            logger.info("\n" + "=" * 60)
+            logger.info("Starting extraction from /Api/AssessmentAggregateStudentResponsesStandard/")
+            logger.info("=" * 60)
+            count = self._extract_from_standards_api(
                 school_ids, start_date, end_date, academic_year
             )
             total_extracted += count
-
-            if count == 0:
-                logger.info("No data from standards endpoint, trying students/assessments...")
-                count = self._extract_illuminate_from_assessments_endpoint(
-                    school_ids, start_date, end_date, academic_year
-                )
-                total_extracted += count
+            logger.info(f"Extracted {count} standards-based assessment records")
 
             logger.info("=" * 60)
             logger.info(f"Illuminate extraction completed. Total records: {total_extracted}")
             logger.info("=" * 60)
-
-            # Optionally sync HMH data automatically
-            if total_extracted > 0:
-                logger.info("Syncing HMH data from Illuminate tables...")
-                self._sync_hmh_data()
 
             return total_extracted
 
@@ -625,6 +794,206 @@ class IlluminateAPIExtractor:
             return total_extracted
         finally:
             self.disconnect_db()
+
+    def _extract_from_standards_api(self,
+                                    school_ids: List[int] = None,
+                                    start_date: str = None,
+                                    end_date: str = None,
+                                    academic_year: str = None) -> int:
+        """
+        Extract ALL assessment data from /Api/AssessmentAggregateStudentResponsesStandard/
+        This is the CORRECT endpoint per Illuminate API documentation.
+        """
+        total_extracted = 0
+        total_skipped = 0
+        page = 1
+
+        while True:
+            params = {
+                'page': page,
+                'limit': 1000  # API docs say use 'limit' not 'per_page'
+            }
+
+            if school_ids:
+                params['site_id'] = ','.join(map(str, school_ids))
+            if start_date:
+                params['start_date'] = start_date
+            if end_date:
+                params['end_date'] = end_date
+
+            data = self._make_api_request('/Api/AssessmentAggregateStudentResponsesStandard/', params)
+
+            if not data or 'results' not in data:
+                break
+
+            results = data['results']
+            if not results:
+                break
+
+            # Use batch insert for better performance
+            for result in results:
+                # Save ALL results (not filtered by HMH) - returns True if saved, False if skipped
+                was_saved = self._process_illuminate_standards_result(result, academic_year)
+                if was_saved:
+                    total_extracted += 1
+                else:
+                    total_skipped += 1
+
+            # Log progress every page
+            num_pages = data.get('num_pages', 1)
+            logger.info(f"Processed page {page}/{num_pages}, saved: {total_extracted}, skipped: {total_skipped}")
+
+            if page >= num_pages:
+                break
+
+            page += 1
+            time.sleep(0.3)  # Rate limiting (reduced for faster extraction)
+
+        if total_skipped > 0:
+            logger.info(f"Total records skipped (no SchoolID): {total_skipped}")
+
+        return total_extracted
+
+    def _process_illuminate_standards_result(self, result: Dict, academic_year: str = None) -> bool:
+        """
+        Process a single standards-based result from /Api/AssessmentAggregateStudentResponsesStandard/
+        and store in Illuminate_Assessment_Results table.
+
+        Returns:
+            True if record was saved, False if skipped
+        """
+        if not self.db_connection:
+            return False
+
+        try:
+            # Determine academic year if not provided
+            if not academic_year:
+                academic_year = self._determine_academic_year(result.get('date_taken'))
+
+            # Enrich with student/school data from cache
+            local_student_id = result.get('local_student_id')
+            student_data = self.students_cache.get(str(local_student_id), {})
+            state_student_id = student_data.get('state_student_id')
+            student_grade = student_data.get('grade_level')
+            site_id = student_data.get('site_id')
+            school_name = student_data.get('site_name')  # From Enrollment API
+            district_name = student_data.get('district_name')
+
+            # Fallback to Sites cache if needed
+            if not school_name and site_id:
+                site_data = self.sites_cache.get(str(site_id), {})
+                school_name = site_data.get('site_name')
+
+            # Skip records without a SchoolID - can't determine which school they belong to
+            if not site_id:
+                logger.debug(f"Skipping record for student {local_student_id} - no SchoolID found")
+                return False
+
+            # Enrich with teacher data from roster and users caches
+            roster_info = self.roster_cache.get(str(local_student_id), {})
+            teacher_id = roster_info.get('user_id')
+
+            # Get teacher info from users cache
+            teacher_info = self.users_cache.get(str(teacher_id), {}) if teacher_id else {}
+            teacher_first_name = teacher_info.get('first_name')
+            teacher_last_name = teacher_info.get('last_name')
+
+            # Use grade level from roster if not in student enrollment
+            if not student_grade and roster_info.get('grade_level_id'):
+                student_grade = roster_info.get('grade_level_id')
+
+            # Extract Subject from StandardCodingNumber
+            # Examples: "ELA-Literacy.RL.3.5" -> "ELA", "Math.1.OA.1" -> "Math"
+            standard_code = result.get('standard_code', '')
+            subject = None
+            if standard_code:
+                if standard_code.startswith('ELA') or 'ELA-' in standard_code or '.ELA.' in standard_code:
+                    subject = 'ELA'
+                elif standard_code.startswith('Math') or 'Math.' in standard_code or '.Math.' in standard_code:
+                    subject = 'Math'
+                elif 'CCSS.ELA' in standard_code:
+                    subject = 'ELA'
+                elif 'CCSS.Math' in standard_code:
+                    subject = 'Math'
+
+            # Map API fields to database columns
+            cursor = self.db_connection.cursor()
+
+            # Check if this record already exists (prevent duplicates)
+            check_query = """
+                SELECT COUNT(*) FROM Illuminate_Assessment_Results
+                WHERE StudentID_LASID = ?
+                AND AssessmentID = ?
+                AND StandardCodingNumber = ?
+                AND DateCompleted = ?
+            """
+
+            cursor.execute(check_query, (
+                local_student_id,
+                result.get('assessment_id'),
+                result.get('standard_code'),
+                self._parse_date(result.get('date_taken'))
+            ))
+
+            exists = cursor.fetchone()[0] > 0
+
+            if exists:
+                # Skip duplicate - return True since record exists (not counted as skipped for SchoolID)
+                cursor.close()
+                return True
+
+            query = """
+                INSERT INTO Illuminate_Assessment_Results (
+                    AcademicYear, DistrictName, SchoolName,
+                    StudentID_SASID, StudentID_LASID,
+                    LastName, FirstName, StudentGrade,
+                    ClassName, TeacherLastName, TeacherFirstName, ClassGrade,
+                    Subject, ProgramName, Publisher, Component, AssignmentName,
+                    AssessmentID, DateCompleted, StandardSet, StandardCodingNumber, StandardDescription,
+                    PointsAchieved, PointsPossible, PercentCorrect, SchoolID
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+
+            values = (
+                academic_year,
+                district_name,  # Enriched from cache
+                school_name,  # Enriched from cache
+                state_student_id,  # Enriched from cache
+                local_student_id,
+                result.get('last_name'),
+                result.get('first_name'),
+                student_grade,  # Enriched from cache
+                None,  # Class name not in response
+                teacher_last_name,  # Enriched from roster/users cache
+                teacher_first_name,  # Enriched from roster/users cache
+                None,  # Class grade not in response
+                subject,  # Extracted from StandardCodingNumber
+                None,  # Program name not in response
+                None,  # Publisher not in response
+                None,  # Component not in response
+                result.get('title'),  # Assignment name = assessment title
+                result.get('assessment_id'),
+                self._parse_date(result.get('date_taken')),
+                None,  # Standard set not provided
+                result.get('standard_code'),
+                result.get('standard_description'),
+                self._safe_decimal(result.get('points')),
+                self._safe_decimal(result.get('points_possible')),
+                self._calculate_percent(result.get('points'), result.get('points_possible')),
+                site_id  # Enriched from cache
+            )
+
+            cursor.execute(query, values)
+            self.db_connection.commit()
+            cursor.close()
+
+            return True  # Successfully saved
+
+        except pyodbc.Error as e:
+            logger.error(f"Failed to save Illuminate standards result: {e}")
+            logger.error(f"Result data: {json.dumps(result, indent=2)}")
+            return False  # Failed to save
 
     def _extract_illuminate_from_standards_endpoint(self,
                                                     school_ids: List[int] = None,
@@ -966,6 +1335,7 @@ class IlluminateAPIExtractor:
         """
         Save assignment to Illuminate_Assignments lookup table.
         Uses MERGE to avoid duplicates.
+        Includes SchoolID to allow same assessment name at different schools.
         """
         if not self.db_connection:
             return
@@ -975,13 +1345,14 @@ class IlluminateAPIExtractor:
 
             query = """
                 MERGE Illuminate_Assignments AS target
-                USING (SELECT ? AS ProgramName, ? AS Component, ? AS AssignmentName) AS source
+                USING (SELECT ? AS ProgramName, ? AS Component, ? AS AssignmentName, ? AS SchoolID) AS source
                 ON (target.ProgramName = source.ProgramName
                     AND target.Component = source.Component
-                    AND target.AssignmentName = source.AssignmentName)
+                    AND target.AssignmentName = source.AssignmentName
+                    AND target.SchoolID = source.SchoolID)
                 WHEN NOT MATCHED THEN
-                    INSERT (ProgramName, Publisher, Component, AssignmentName, IlluminateAssessmentID, Subject)
-                    VALUES (?, ?, ?, ?, ?, ?);
+                    INSERT (ProgramName, Publisher, Component, AssignmentName, IlluminateAssessmentID, Subject, SchoolID)
+                    VALUES (?, ?, ?, ?, ?, ?, ?);
             """
 
             program = common_data.get('ProgramName')
@@ -990,10 +1361,11 @@ class IlluminateAPIExtractor:
             assignment = common_data.get('AssignmentName')
             assessment_id = common_data.get('AssessmentID')
             subject = common_data.get('Subject')
+            school_id = common_data.get('SchoolID')
 
             values = (
-                program, component, assignment,  # For the USING clause
-                program, publisher, component, assignment, assessment_id, subject  # For the INSERT
+                program, component, assignment, school_id,  # For the USING clause
+                program, publisher, component, assignment, assessment_id, subject, school_id  # For the INSERT
             )
 
             cursor.execute(query, values)
@@ -1497,6 +1869,7 @@ class IlluminateAPIExtractor:
         """
         Save assignment to HMH_Assignments lookup table.
         Uses MERGE to avoid duplicates.
+        Includes SchoolID to allow same assessment name at different schools.
         """
         if not self.db_connection:
             return
@@ -1506,23 +1879,25 @@ class IlluminateAPIExtractor:
 
             query = """
                 MERGE HMH_Assignments AS target
-                USING (SELECT ? AS ProgramName, ? AS Component, ? AS AssignmentName) AS source
+                USING (SELECT ? AS ProgramName, ? AS Component, ? AS AssignmentName, ? AS SchoolID) AS source
                 ON (target.ProgramName = source.ProgramName
                     AND target.Component = source.Component
-                    AND target.AssignmentName = source.AssignmentName)
+                    AND target.AssignmentName = source.AssignmentName
+                    AND target.SchoolID = source.SchoolID)
                 WHEN NOT MATCHED THEN
-                    INSERT (ProgramName, Component, AssignmentName, Subject)
-                    VALUES (?, ?, ?, ?);
+                    INSERT (ProgramName, Component, AssignmentName, Subject, SchoolID)
+                    VALUES (?, ?, ?, ?, ?);
             """
 
             program = common_data.get('ProgramName')
             component = common_data.get('Component')
             assignment = common_data.get('AssignmentName')
             subject = common_data.get('Subject')
+            school_id = common_data.get('SchoolID')
 
             values = (
-                program, component, assignment,  # For the USING clause
-                program, component, assignment, subject  # For the INSERT
+                program, component, assignment, school_id,  # For the USING clause
+                program, component, assignment, subject, school_id  # For the INSERT
             )
 
             cursor.execute(query, values)
@@ -1607,15 +1982,14 @@ def main():
 
     # Configuration for extraction
     school_ids = None  # e.g., [123, 456, 789] - Set to None to extract all schools
-    start_date = '2024-01-01'  # Set your date range
-    end_date = '2024-12-31'
-    academic_year = '2024-2025'  # Set your academic year
+    start_date = '2025-09-01'  # Set your date range
+    end_date = '2026-06-20'
+    academic_year = '2025-2026'  # Set your academic year
 
     print("=" * 80)
     print("Illuminate Assessment Data Extractor")
     print("=" * 80)
-    print("This extracts ALL Illuminate assessment data to Illuminate_* tables,")
-    print("then automatically syncs HMH data to HMH_* tables.")
+    print("This extracts ALL Illuminate assessment data to Illuminate_* tables.")
     print("=" * 80)
     print(f"School IDs: {school_ids if school_ids else 'All schools'}")
     print(f"Date Range: {start_date} to {end_date}")
@@ -1634,13 +2008,13 @@ def main():
     print("=" * 80)
     print(f"Extraction completed successfully!")
     print(f"Total Illuminate assessment records extracted: {total_records}")
-    print(f"HMH data has been automatically synced to HMH_* tables.")
     print("=" * 80)
     print()
     print("Data Location:")
-    print("  - All Illuminate data: Illuminate_Assessment_Results, Illuminate_Assessment_Summary")
-    print("  - HMH data only: HMH_Assessment_Results, HMH_Assessment_Summary")
-    print("  - To manually re-sync HMH data: EXEC sp_Sync_HMH_Data")
+    print("  - Illuminate_Assessment_Results - Standards-based assessment data")
+    print("  - Illuminate_Assessment_Summary - Overall assessment summaries")
+    print("  - Illuminate_Standards - Standards lookup table")
+    print("  - Illuminate_Assignments - Assignments lookup table")
     print("=" * 80)
 
 
