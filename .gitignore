@@ -1,5 +1,6 @@
 # Configuration files with sensitive data
 config.ini
+populate_lookup_tables.py  # Contains SQL credentials - use .template instead
 
 # Python
 __pycache__/

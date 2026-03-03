@@ -803,8 +803,11 @@ class IlluminateAPIExtractor:
         """
         Extract ALL assessment data from /Api/AssessmentAggregateStudentResponsesStandard/
         This is the CORRECT endpoint per Illuminate API documentation.
+        Updates existing records and inserts new ones.
         """
         total_extracted = 0
+        total_updated = 0
+        total_inserted = 0
         total_skipped = 0
         page = 1
 
@@ -832,16 +835,20 @@ class IlluminateAPIExtractor:
 
             # Use batch insert for better performance
             for result in results:
-                # Save ALL results (not filtered by HMH) - returns True if saved, False if skipped
-                was_saved = self._process_illuminate_standards_result(result, academic_year)
-                if was_saved:
+                # Save ALL results (not filtered by HMH) - returns (success, was_update)
+                success, was_update = self._process_illuminate_standards_result(result, academic_year)
+                if success:
                     total_extracted += 1
+                    if was_update:
+                        total_updated += 1
+                    else:
+                        total_inserted += 1
                 else:
                     total_skipped += 1
 
             # Log progress every page
             num_pages = data.get('num_pages', 1)
-            logger.info(f"Processed page {page}/{num_pages}, saved: {total_extracted}, skipped: {total_skipped}")
+            logger.info(f"Processed page {page}/{num_pages}, inserted: {total_inserted}, updated: {total_updated}, skipped: {total_skipped}")
 
             if page >= num_pages:
                 break
@@ -849,21 +856,28 @@ class IlluminateAPIExtractor:
             page += 1
             time.sleep(0.3)  # Rate limiting (reduced for faster extraction)
 
+        # Log final summary
+        logger.info(f"Extraction complete - Total processed: {total_extracted}")
+        logger.info(f"  - New records inserted: {total_inserted}")
+        logger.info(f"  - Existing records updated: {total_updated}")
         if total_skipped > 0:
-            logger.info(f"Total records skipped (no SchoolID): {total_skipped}")
+            logger.info(f"  - Records skipped (no SchoolID): {total_skipped}")
 
         return total_extracted
 
-    def _process_illuminate_standards_result(self, result: Dict, academic_year: str = None) -> bool:
+    def _process_illuminate_standards_result(self, result: Dict, academic_year: str = None) -> tuple:
         """
         Process a single standards-based result from /Api/AssessmentAggregateStudentResponsesStandard/
         and store in Illuminate_Assessment_Results table.
 
         Returns:
-            True if record was saved, False if skipped
+            Tuple of (success: bool, was_update: bool)
+            - (True, True) if record was updated
+            - (True, False) if record was inserted
+            - (False, False) if record was skipped or failed
         """
         if not self.db_connection:
-            return False
+            return (False, False)
 
         try:
             # Determine academic year if not provided
@@ -887,7 +901,7 @@ class IlluminateAPIExtractor:
             # Skip records without a SchoolID - can't determine which school they belong to
             if not site_id:
                 logger.debug(f"Skipping record for student {local_student_id} - no SchoolID found")
-                return False
+                return (False, False)
 
             # Enrich with teacher data from roster and users caches
             roster_info = self.roster_cache.get(str(local_student_id), {})
@@ -919,7 +933,7 @@ class IlluminateAPIExtractor:
             # Map API fields to database columns
             cursor = self.db_connection.cursor()
 
-            # Check if this record already exists (prevent duplicates)
+            # Check if this record already exists
             check_query = """
                 SELECT COUNT(*) FROM Illuminate_Assessment_Results
                 WHERE StudentID_LASID = ?
@@ -938,10 +952,74 @@ class IlluminateAPIExtractor:
             exists = cursor.fetchone()[0] > 0
 
             if exists:
-                # Skip duplicate - return True since record exists (not counted as skipped for SchoolID)
-                cursor.close()
-                return True
+                # Update existing record with latest data (AssignmentName may have changed)
+                query = """
+                    UPDATE Illuminate_Assessment_Results
+                    SET
+                        AcademicYear = ?,
+                        DistrictName = ?,
+                        SchoolName = ?,
+                        StudentID_SASID = ?,
+                        LastName = ?,
+                        FirstName = ?,
+                        StudentGrade = ?,
+                        ClassName = ?,
+                        TeacherLastName = ?,
+                        TeacherFirstName = ?,
+                        ClassGrade = ?,
+                        Subject = ?,
+                        ProgramName = ?,
+                        Publisher = ?,
+                        Component = ?,
+                        AssignmentName = ?,
+                        StandardSet = ?,
+                        StandardDescription = ?,
+                        PointsAchieved = ?,
+                        PointsPossible = ?,
+                        PercentCorrect = ?,
+                        SchoolID = ?
+                    WHERE StudentID_LASID = ?
+                    AND AssessmentID = ?
+                    AND StandardCodingNumber = ?
+                    AND DateCompleted = ?
+                """
 
+                values = (
+                    academic_year,
+                    district_name,
+                    school_name,
+                    state_student_id,
+                    result.get('last_name'),
+                    result.get('first_name'),
+                    student_grade,
+                    None,  # Class name not in response
+                    teacher_last_name,
+                    teacher_first_name,
+                    None,  # Class grade not in response
+                    subject,
+                    None,  # Program name not in response
+                    None,  # Publisher not in response
+                    None,  # Component not in response
+                    result.get('title'),  # Updated assignment name
+                    None,  # Standard set not provided
+                    result.get('standard_description'),
+                    self._safe_decimal(result.get('points')),
+                    self._safe_decimal(result.get('points_possible')),
+                    self._calculate_percent(result.get('points'), result.get('points_possible')),
+                    site_id,
+                    # WHERE clause parameters
+                    local_student_id,
+                    result.get('assessment_id'),
+                    result.get('standard_code'),
+                    self._parse_date(result.get('date_taken'))
+                )
+
+                cursor.execute(query, values)
+                self.db_connection.commit()
+                cursor.close()
+                return (True, True)  # Successfully updated
+
+            # Insert new record
             query = """
                 INSERT INTO Illuminate_Assessment_Results (
                     AcademicYear, DistrictName, SchoolName,
@@ -988,12 +1066,12 @@ class IlluminateAPIExtractor:
             self.db_connection.commit()
             cursor.close()
 
-            return True  # Successfully saved
+            return (True, False)  # Successfully inserted
 
         except pyodbc.Error as e:
             logger.error(f"Failed to save Illuminate standards result: {e}")
             logger.error(f"Result data: {json.dumps(result, indent=2)}")
-            return False  # Failed to save
+            return (False, False)  # Failed to save
 
     def _extract_illuminate_from_standards_endpoint(self,
                                                     school_ids: List[int] = None,
