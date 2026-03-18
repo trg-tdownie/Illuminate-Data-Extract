@@ -222,6 +222,9 @@ class IlluminateAPIExtractor:
                     f'SERVER={server};'
                     f'DATABASE={database};'
                     f'Trusted_Connection=yes;'
+                    f'Connection Timeout=30;'
+                    f'Login Timeout=30;'
+                    f'Mars_Connection=yes;'
                 )
             else:
                 username = self.config.get('database', 'username')
@@ -232,6 +235,9 @@ class IlluminateAPIExtractor:
                     f'DATABASE={database};'
                     f'UID={username};'
                     f'PWD={password};'
+                    f'Connection Timeout=30;'
+                    f'Login Timeout=30;'
+                    f'Mars_Connection=yes;'
                 )
 
             self.db_connection = pyodbc.connect(conn_string)
@@ -931,25 +937,54 @@ class IlluminateAPIExtractor:
                     subject = 'Math'
 
             # Map API fields to database columns
-            cursor = self.db_connection.cursor()
+            # Retry logic for database operations
+            max_retries = 3
+            retry_count = 0
+            last_error = None
 
-            # Check if this record already exists
-            check_query = """
-                SELECT COUNT(*) FROM Illuminate_Assessment_Results
-                WHERE StudentID_LASID = ?
-                AND AssessmentID = ?
-                AND StandardCodingNumber = ?
-                AND DateCompleted = ?
-            """
+            while retry_count < max_retries:
+                try:
+                    cursor = self.db_connection.cursor()
 
-            cursor.execute(check_query, (
-                local_student_id,
-                result.get('assessment_id'),
-                result.get('standard_code'),
-                self._parse_date(result.get('date_taken'))
-            ))
+                    # Check if this record already exists
+                    check_query = """
+                        SELECT COUNT(*) FROM Illuminate_Assessment_Results
+                        WHERE StudentID_LASID = ?
+                        AND AssessmentID = ?
+                        AND StandardCodingNumber = ?
+                        AND DateCompleted = ?
+                    """
 
-            exists = cursor.fetchone()[0] > 0
+                    cursor.execute(check_query, (
+                        local_student_id,
+                        result.get('assessment_id'),
+                        result.get('standard_code'),
+                        self._parse_date(result.get('date_taken'))
+                    ))
+
+                    exists = cursor.fetchone()[0] > 0
+                    break  # Success - exit retry loop
+
+                except pyodbc.OperationalError as e:
+                    last_error = e
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        wait_time = 2 ** retry_count  # Exponential backoff: 2, 4, 8 seconds
+                        logger.warning(f"Database connection error (attempt {retry_count}/{max_retries}): {e}")
+                        logger.warning(f"Reconnecting in {wait_time} seconds...")
+                        time.sleep(wait_time)
+
+                        # Try to reconnect
+                        try:
+                            if self.db_connection:
+                                self.db_connection.close()
+                            self.connect_db()
+                            logger.info("Successfully reconnected to database")
+                        except Exception as reconnect_error:
+                            logger.error(f"Failed to reconnect: {reconnect_error}")
+                    else:
+                        logger.error(f"Failed after {max_retries} attempts: {last_error}")
+                        return (False, False)
 
             if exists:
                 # Update existing record with latest data (AssignmentName may have changed)
@@ -1014,10 +1049,36 @@ class IlluminateAPIExtractor:
                     self._parse_date(result.get('date_taken'))
                 )
 
-                cursor.execute(query, values)
-                self.db_connection.commit()
-                cursor.close()
-                return (True, True)  # Successfully updated
+                # Execute UPDATE with retry logic
+                retry_count = 0
+                while retry_count < max_retries:
+                    try:
+                        cursor.execute(query, values)
+                        self.db_connection.commit()
+                        cursor.close()
+                        return (True, True)  # Successfully updated
+
+                    except pyodbc.OperationalError as e:
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            wait_time = 2 ** retry_count
+                            logger.warning(f"Database error during UPDATE (attempt {retry_count}/{max_retries}): {e}")
+                            logger.warning(f"Retrying in {wait_time} seconds...")
+                            time.sleep(wait_time)
+
+                            # Reconnect and recreate cursor
+                            try:
+                                if self.db_connection:
+                                    self.db_connection.close()
+                                self.connect_db()
+                                cursor = self.db_connection.cursor()
+                                logger.info("Reconnected, retrying UPDATE")
+                            except Exception as reconnect_error:
+                                logger.error(f"Failed to reconnect: {reconnect_error}")
+                                return (False, False)
+                        else:
+                            logger.error(f"UPDATE failed after {max_retries} attempts: {e}")
+                            return (False, False)
 
             # Insert new record
             query = """
@@ -1062,11 +1123,36 @@ class IlluminateAPIExtractor:
                 site_id  # Enriched from cache
             )
 
-            cursor.execute(query, values)
-            self.db_connection.commit()
-            cursor.close()
+            # Execute INSERT with retry logic
+            retry_count = 0
+            while retry_count < max_retries:
+                try:
+                    cursor.execute(query, values)
+                    self.db_connection.commit()
+                    cursor.close()
+                    return (True, False)  # Successfully inserted
 
-            return (True, False)  # Successfully inserted
+                except pyodbc.OperationalError as e:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        wait_time = 2 ** retry_count
+                        logger.warning(f"Database error during INSERT (attempt {retry_count}/{max_retries}): {e}")
+                        logger.warning(f"Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+
+                        # Reconnect and recreate cursor
+                        try:
+                            if self.db_connection:
+                                self.db_connection.close()
+                            self.connect_db()
+                            cursor = self.db_connection.cursor()
+                            logger.info("Reconnected, retrying INSERT")
+                        except Exception as reconnect_error:
+                            logger.error(f"Failed to reconnect: {reconnect_error}")
+                            return (False, False)
+                    else:
+                        logger.error(f"INSERT failed after {max_retries} attempts: {e}")
+                        return (False, False)
 
         except pyodbc.Error as e:
             logger.error(f"Failed to save Illuminate standards result: {e}")
