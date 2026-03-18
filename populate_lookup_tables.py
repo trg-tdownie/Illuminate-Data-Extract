@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""
+Populate Illuminate Lookup Tables
+This script populates Illuminate_Assignments and Illuminate_Standards tables
+from the extracted assessment results data.
+
+Must be run AFTER illuminate_extractor.py completes successfully.
+"""
+
+import pyodbc
+import logging
+import sys
+from pathlib import Path
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class LookupTablePopulator:
+    def __init__(self):
+        self.db_connection = None
+
+    def connect_db(self):
+        """Connect to SQL Server database using SQL Authentication."""
+        try:
+            # SQL Authentication (works from macOS)
+            # TODO: Update with your SQL Server credentials
+            SQL_USER = "trg-dashboard"  # Update this
+            SQL_PASSWORD = "qptpP<xf/rv#:5S"  # Update this
+
+            conn_str = (
+                r'DRIVER={ODBC Driver 17 for SQL Server};'
+                r'SERVER=10.10.10.200;'
+                r'DATABASE=TRG_Dashboard;'
+                f'UID={SQL_USER};'
+                f'PWD={SQL_PASSWORD};'
+            )
+
+            self.db_connection = pyodbc.connect(conn_str)
+            logger.info("Successfully connected to SQL Server database")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to database: {e}")
+            logger.error("Please update SQL_USER and SQL_PASSWORD in the connect_db() method")
+            return False
+
+    def disconnect_db(self):
+        """Close database connection."""
+        if self.db_connection:
+            self.db_connection.close()
+            logger.info("Database connection closed")
+
+    def run_sql_script(self, script_path: str, description: str) -> bool:
+        """Execute a SQL script file."""
+        try:
+            logger.info(f"Running: {description}")
+            logger.info(f"Script: {script_path}")
+
+            # Read the SQL script
+            with open(script_path, 'r') as f:
+                sql_script = f.read()
+
+            # Split by GO statements and execute each batch
+            batches = sql_script.split('\nGO\n')
+            cursor = self.db_connection.cursor()
+
+            for batch in batches:
+                batch = batch.strip()
+                if batch and not batch.startswith('--'):
+                    try:
+                        cursor.execute(batch)
+                        # Fetch and display any PRINT statements
+                        while cursor.nextset():
+                            pass
+                    except pyodbc.Error as e:
+                        # Some errors are just informational (like PRINT statements)
+                        if "SqlState = '01000'" in str(e):
+                            continue
+                        raise
+
+            self.db_connection.commit()
+            cursor.close()
+
+            logger.info(f"✓ Success: {description} completed\n")
+            return True
+
+        except Exception as e:
+            logger.error(f"✗ Error: {description} failed")
+            logger.error(f"Error details: {e}")
+            return False
+
+    def populate_all_tables(self):
+        """Run all SQL scripts in the correct order."""
+        logger.info("=" * 80)
+        logger.info("Illuminate Lookup Tables Population")
+        logger.info("=" * 80)
+        logger.info("")
+        logger.info("This will populate:")
+        logger.info("  - Illuminate_Assignments (from assessment results)")
+        logger.info("  - Illuminate_Standards (from assessment results + GLCE)")
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("")
+
+        # Connect to database
+        if not self.connect_db():
+            return False
+
+        # Define scripts in execution order
+        scripts = [
+            ("update_assignments_unique_constraint.sql",
+             "Step 1/4: Updating Illuminate_Assignments unique constraint"),
+            ("populate_assessments_from_results.sql",
+             "Step 2/4: Populating Illuminate_Assignments table"),
+            ("add_columns_to_standards.sql",
+             "Step 3/4: Adding columns to Illuminate_Standards table"),
+            ("populate_standards_from_results_and_glce.sql",
+             "Step 4/4: Populating Illuminate_Standards table")
+        ]
+
+        # Run each script
+        for script_name, description in scripts:
+            script_path = Path(__file__).parent / script_name
+
+            if not script_path.exists():
+                logger.error(f"Script not found: {script_path}")
+                self.disconnect_db()
+                return False
+
+            if not self.run_sql_script(str(script_path), description):
+                self.disconnect_db()
+                return False
+
+        # Success
+        logger.info("=" * 80)
+        logger.info("✓ All lookup tables populated successfully!")
+        logger.info("=" * 80)
+        logger.info("")
+        logger.info("Summary:")
+        logger.info("  ✓ Illuminate_Assignments - Populated from assessment results")
+        logger.info("  ✓ Illuminate_Standards - Populated and enriched with GLCE data")
+        logger.info("")
+        logger.info("Next steps:")
+        logger.info("  - Verify the data in your database")
+        logger.info("  - Set up incremental updates using illuminate_extractor_incremental.py")
+        logger.info("")
+
+        self.disconnect_db()
+        return True
+
+
+if __name__ == "__main__":
+    print("")
+    print("=" * 80)
+    print("Illuminate Lookup Tables Population Script")
+    print("=" * 80)
+    print("")
+    print("IMPORTANT: Before running this script, update the database connection")
+    print("string in the connect_db() method with your SQL Server details:")
+    print("  - SERVER name")
+    print("  - DATABASE name")
+    print("  - Authentication method (Windows or SQL)")
+    print("")
+    print("=" * 80)
+    print("")
+
+    populator = LookupTablePopulator()
+
+    try:
+        success = populator.populate_all_tables()
+        sys.exit(0 if success else 1)
+    except KeyboardInterrupt:
+        logger.info("\nOperation cancelled by user")
+        populator.disconnect_db()
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        populator.disconnect_db()
+        sys.exit(1)
