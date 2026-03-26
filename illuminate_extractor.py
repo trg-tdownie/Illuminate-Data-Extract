@@ -7,6 +7,7 @@ with standards-based scoring and stores in SQL Server database
 import requests
 import json
 import pyodbc
+import re
 from requests_oauthlib import OAuth1Session, OAuth1
 from datetime import datetime
 import logging
@@ -922,6 +923,27 @@ class IlluminateAPIExtractor:
             if not student_grade and roster_info.get('grade_level_id'):
                 student_grade = roster_info.get('grade_level_id')
 
+            # FIX: For affected schools, parse grade from assignment name to correct +1 offset
+            # Schools: Merritt Academy (50906), Madison Academy (25911), New Standard Academy (25912), Merritt MS (5090611)
+            affected_schools = [50906, 25911, 25912, 5090611]
+            assignment_name = result.get('title', '')
+
+            if site_id and int(site_id) in affected_schools and assignment_name:
+                # Try to extract grade from assignment name patterns
+                # Pattern 1: "4.Math.Test1", "3ELAMod1" - starts with digit(s)
+                match = re.match(r'^(\d{1,2})[.\w]', assignment_name)
+                if match:
+                    parsed_grade = match.group(1)
+                    logger.debug(f"Parsed grade {parsed_grade} from assignment '{assignment_name}' for affected school {site_id}")
+                    student_grade = parsed_grade
+                # Pattern 2: "2nd grade 10/10", "4th Math PM#1" - digit followed by st/nd/rd/th
+                else:
+                    match = re.match(r'^(\d+)(st|nd|rd|th)\s+', assignment_name, re.IGNORECASE)
+                    if match:
+                        parsed_grade = match.group(1)
+                        logger.debug(f"Parsed grade {parsed_grade} from assignment '{assignment_name}' for affected school {site_id}")
+                        student_grade = parsed_grade
+
             # Extract Subject from StandardCodingNumber
             # Examples: "ELA-Literacy.RL.3.5" -> "ELA", "Math.1.OA.1" -> "Math"
             standard_code = result.get('standard_code', '')
@@ -935,6 +957,36 @@ class IlluminateAPIExtractor:
                     subject = 'ELA'
                 elif 'CCSS.Math' in standard_code:
                     subject = 'Math'
+
+            # Fallback: Extract subject from AssignmentName if StandardCodingNumber didn't provide it
+            if not subject and assignment_name:
+                assignment_lower = assignment_name.lower()
+
+                # Check for Science
+                if 'science' in assignment_lower or 'sci' in assignment_lower:
+                    subject = 'Science'
+                # Check for Social Studies (SS, Social, History)
+                elif assignment_name.upper().startswith('SS') or 'social' in assignment_lower or 'history' in assignment_lower:
+                    subject = 'Social Studies'
+                # Check for ELA
+                elif 'ela' in assignment_lower or 'english' in assignment_lower or 'reading' in assignment_lower:
+                    subject = 'ELA'
+                # Check for Math
+                elif 'math' in assignment_lower:
+                    subject = 'Math'
+
+            # Infer StandardSet from StandardCodingNumber prefix
+            # CCSS.* = Common Core State Standards (NGA/CCSSO)
+            # ELA-Literacy.* or Math.Content.* (no CCSS) = Michigan State Standards
+            standard_set = None
+            if standard_code:
+                if standard_code.startswith('CCSS.'):
+                    standard_set = 'Common Core State Standards'
+                elif standard_code.startswith('ELA-Literacy.') or standard_code.startswith('Math.Content.'):
+                    standard_set = 'Michigan State Standards'
+                # Try from API first (may be provided)
+                if not standard_set and result.get('standard_set'):
+                    standard_set = result.get('standard_set')
 
             # Map API fields to database columns
             # Retry logic for database operations
@@ -1036,7 +1088,7 @@ class IlluminateAPIExtractor:
                     None,  # Publisher not in response
                     None,  # Component not in response
                     result.get('title'),  # Updated assignment name
-                    None,  # Standard set not provided
+                    standard_set,  # Inferred from standard code prefix
                     result.get('standard_description'),
                     self._safe_decimal(result.get('points')),
                     self._safe_decimal(result.get('points_possible')),
@@ -1114,7 +1166,7 @@ class IlluminateAPIExtractor:
                 result.get('title'),  # Assignment name = assessment title
                 result.get('assessment_id'),
                 self._parse_date(result.get('date_taken')),
-                None,  # Standard set not provided
+                standard_set,  # Inferred from standard code prefix
                 result.get('standard_code'),
                 result.get('standard_description'),
                 self._safe_decimal(result.get('points')),
