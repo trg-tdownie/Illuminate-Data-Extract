@@ -114,10 +114,13 @@ class IlluminateAPIExtractor:
                 # Cache by district_student_id (which matches local_student_id in assessments)
                 if district_student_id:
                     site_id = enrollment.get('site_id')
+                    # Convert grade_level_id to actual grade (K=1, 1st=2, etc. -> K, 1, 2, etc.)
+                    grade_level_id = enrollment.get('grade_level_id')
+                    actual_grade = self._convert_grade_level_id(grade_level_id)
                     self.students_cache[str(district_student_id)] = {
                         'state_student_id': state_student_id,
                         'student_id': student_id,
-                        'grade_level': enrollment.get('grade_level'),
+                        'grade_level': actual_grade,
                         'site_id': str(site_id) if site_id else None,
                         'site_name': enrollment.get('school'),  # Enrollment API returns 'school' field
                         'district_name': enrollment.get('district')
@@ -921,28 +924,8 @@ class IlluminateAPIExtractor:
 
             # Use grade level from roster if not in student enrollment
             if not student_grade and roster_info.get('grade_level_id'):
-                student_grade = roster_info.get('grade_level_id')
-
-            # FIX: For affected schools, parse grade from assignment name to correct +1 offset
-            # Schools: Merritt Academy (50906), Madison Academy (25911), New Standard Academy (25912), Merritt MS (5090611)
-            affected_schools = [50906, 25911, 25912, 5090611]
-            assignment_name = result.get('title', '')
-
-            if site_id and int(site_id) in affected_schools and assignment_name:
-                # Try to extract grade from assignment name patterns
-                # Pattern 1: "4.Math.Test1", "3ELAMod1" - starts with digit(s)
-                match = re.match(r'^(\d{1,2})[.\w]', assignment_name)
-                if match:
-                    parsed_grade = match.group(1)
-                    logger.debug(f"Parsed grade {parsed_grade} from assignment '{assignment_name}' for affected school {site_id}")
-                    student_grade = parsed_grade
-                # Pattern 2: "2nd grade 10/10", "4th Math PM#1" - digit followed by st/nd/rd/th
-                else:
-                    match = re.match(r'^(\d+)(st|nd|rd|th)\s+', assignment_name, re.IGNORECASE)
-                    if match:
-                        parsed_grade = match.group(1)
-                        logger.debug(f"Parsed grade {parsed_grade} from assignment '{assignment_name}' for affected school {site_id}")
-                        student_grade = parsed_grade
+                # Convert grade_level_id to actual grade
+                student_grade = self._convert_grade_level_id(roster_info.get('grade_level_id'))
 
             # Extract Subject from StandardCodingNumber
             # Examples: "ELA-Literacy.RL.3.5" -> "ELA", "Math.1.OA.1" -> "Math"
@@ -2140,6 +2123,31 @@ class IlluminateAPIExtractor:
             else:
                 return f"{date.year - 1}-{date.year}"
         except:
+            return None
+
+    def _convert_grade_level_id(self, grade_level_id):
+        """
+        Convert Illuminate's grade_level_id to actual grade number.
+        Illuminate uses: K=1, 1st=2, 2nd=3, 3rd=4, 4th=5, 5th=6, etc.
+        We need to subtract 1 to get the actual grade.
+
+        Returns:
+            str: Grade level as string ('K' for kindergarten, '0' for pre-K, or number as string)
+            None: If grade_level_id is None or invalid
+        """
+        if grade_level_id is None:
+            return None
+
+        try:
+            grade_id = int(grade_level_id)
+            if grade_id <= 0:
+                return None
+            elif grade_id == 1:
+                return 'K'  # Kindergarten
+            else:
+                return str(grade_id - 1)  # Subtract 1 for actual grade
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid grade_level_id: {grade_level_id}")
             return None
 
     def _parse_date(self, date_str: str) -> Optional[str]:
