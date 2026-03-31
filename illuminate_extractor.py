@@ -942,6 +942,7 @@ class IlluminateAPIExtractor:
                     subject = 'Math'
 
             # Fallback: Extract subject from AssignmentName if StandardCodingNumber didn't provide it
+            assignment_name = result.get('title', '')
             if not subject and assignment_name:
                 assignment_lower = assignment_name.lower()
 
