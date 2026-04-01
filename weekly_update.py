@@ -234,7 +234,14 @@ class WeeklyUpdater:
                     ClassName,
                     TeacherLastName,
                     TeacherFirstName,
-                    Subject,
+                    -- Derive subject from AssignmentName when missing
+                    CASE
+                        WHEN AssignmentName LIKE '%Math%' OR AssignmentName LIKE '%math%' THEN 'Mathematics'
+                        WHEN AssignmentName LIKE '%ELA%' OR AssignmentName LIKE '%ela%' OR AssignmentName LIKE '%English%' THEN 'English Language Arts'
+                        WHEN AssignmentName LIKE '%Science%' OR AssignmentName LIKE '%science%' THEN 'Science'
+                        WHEN AssignmentName LIKE '%Social%' OR AssignmentName LIKE '%History%' THEN 'Social Studies'
+                        ELSE Subject
+                    END as Subject,
                     ProgramName,
                     Publisher,
                     Component,
@@ -258,7 +265,15 @@ class WeeklyUpdater:
                     StudentID_SASID, StudentID_LASID,
                     LastName, FirstName, StudentGrade,
                     ClassName, TeacherLastName, TeacherFirstName,
-                    Subject, ProgramName, Publisher, Component, AssignmentName,
+                    -- Include CASE statement in GROUP BY
+                    CASE
+                        WHEN AssignmentName LIKE '%Math%' OR AssignmentName LIKE '%math%' THEN 'Mathematics'
+                        WHEN AssignmentName LIKE '%ELA%' OR AssignmentName LIKE '%ela%' OR AssignmentName LIKE '%English%' THEN 'English Language Arts'
+                        WHEN AssignmentName LIKE '%Science%' OR AssignmentName LIKE '%science%' THEN 'Science'
+                        WHEN AssignmentName LIKE '%Social%' OR AssignmentName LIKE '%History%' THEN 'Social Studies'
+                        ELSE Subject
+                    END,
+                    ProgramName, Publisher, Component, AssignmentName,
                     AssessmentID, DateCompleted, SchoolID
                 ORDER BY DateCompleted, LastName, FirstName, AssignmentName
             """)
