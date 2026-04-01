@@ -5,6 +5,8 @@ Runs every Monday to pull the last week's data and update all tables
 
 This script:
 1. Extracts assessment data from the last 7 days
+   - Uses section-based teacher matching via LPC_StudentRoster
+   - Matches students to their actual subject teacher (not homeroom)
 2. Updates Illuminate_Assignments lookup table
 3. Updates Illuminate_Standards lookup table
 4. Rebuilds Illuminate_Assessment_Summary table
