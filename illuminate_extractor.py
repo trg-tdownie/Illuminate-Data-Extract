@@ -40,7 +40,8 @@ class IlluminateAPIExtractor:
         self.sites_cache = {}  # Cache for site/school information
         self.students_cache = {}  # Cache for student information
         self.users_cache = {}  # Cache for user/teacher information
-        self.roster_cache = {}  # Cache for student-teacher assignments
+        self.roster_cache = {}  # Cache for student-teacher assignments (ALL sections per student)
+        self.lpc_roster_cache = {}  # Cache for LPC_StudentRoster (student->section->teacher)
         self._setup_oauth()
 
     def _load_config(self, config_file: str) -> configparser.ConfigParser:
@@ -190,15 +191,17 @@ class IlluminateAPIExtractor:
             for record in results:
                 district_student_id = record.get('district_student_id')
                 if district_student_id:
-                    # Store by student ID - may have multiple sections, we'll use first one
+                    # Store ALL sections for each student (not just first)
                     if str(district_student_id) not in self.roster_cache:
-                        self.roster_cache[str(district_student_id)] = {
-                            'user_id': str(record.get('user_id')),
-                            'grade_level_id': record.get('grade_level_id'),
-                            'section_id': record.get('section_id'),
-                            'site_id': record.get('site_id'),
-                            'course_id': record.get('course_id')
-                        }
+                        self.roster_cache[str(district_student_id)] = []
+
+                    self.roster_cache[str(district_student_id)].append({
+                        'user_id': str(record.get('user_id')),
+                        'grade_level_id': record.get('grade_level_id'),
+                        'section_id': str(record.get('section_id')),
+                        'site_id': record.get('site_id'),
+                        'course_id': record.get('course_id')
+                    })
 
             logger.info(f"Loaded page {page} of roster, total cached: {len(self.roster_cache)}")
 
@@ -209,6 +212,49 @@ class IlluminateAPIExtractor:
             time.sleep(0.2)
 
         logger.info(f"Finished loading {len(self.roster_cache)} student-teacher assignments")
+
+    def _load_lpc_roster_cache(self):
+        """Load LPC_StudentRoster table from database into cache for teacher matching"""
+        if not self.db_connection:
+            logger.warning("Database not connected. Cannot load LPC roster cache.")
+            return
+
+        logger.info("Loading LPC_StudentRoster from database...")
+
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute("""
+                SELECT
+                    StudentID,
+                    sectionID,
+                    TeacherFirst,
+                    TeacherLast,
+                    SubjectArea,
+                    GradeLevel
+                FROM LPC_StudentRoster
+            """)
+
+            for row in cursor.fetchall():
+                student_id = str(row[0])
+                section_id = str(row[1])
+
+                # Store by student ID - each student can have multiple sections
+                if student_id not in self.lpc_roster_cache:
+                    self.lpc_roster_cache[student_id] = []
+
+                self.lpc_roster_cache[student_id].append({
+                    'section_id': section_id,
+                    'teacher_first': row[2],
+                    'teacher_last': row[3],
+                    'subject_area': row[4],  # 1=ELA, 2=Math, 3=Science, 4=Social Studies
+                    'grade_level': row[5]
+                })
+
+            cursor.close()
+            logger.info(f"Loaded LPC roster for {len(self.lpc_roster_cache)} students")
+
+        except Exception as e:
+            logger.error(f"Error loading LPC_StudentRoster cache: {e}")
 
     def connect_db(self):
         """Connect to SQL Server database"""
@@ -730,6 +776,46 @@ class IlluminateAPIExtractor:
     # These methods extract ALL Illuminate assessment data to Illuminate_* tables
     # Then HMH data can be filtered/synced to HMH_* tables using sp_Sync_HMH_Data
 
+    def _match_section_for_assessment(self, student_id: str, subject: str) -> Tuple[Optional[str], Optional[Dict]]:
+        """
+        Find the correct section for a student based on assessment subject.
+        Uses LPC_StudentRoster table to match by SubjectArea.
+
+        Subject mapping:
+        - 'ELA' or 'English' -> SubjectArea = 1
+        - 'Math' or 'Mathematics' -> SubjectArea = 2
+        - 'Science' -> SubjectArea = 3
+        - 'Social Studies' -> SubjectArea = 4
+
+        Returns:
+            Tuple of (section_id, section_info_dict) or (None, None) if not found
+        """
+        lpc_sections = self.lpc_roster_cache.get(str(student_id), [])
+
+        if not lpc_sections:
+            return (None, None)
+
+        # Map assessment subject to SubjectArea code
+        subject_map = {
+            'ELA': 1,
+            'English': 1,
+            'Math': 2,
+            'Mathematics': 2,
+            'Science': 3,
+            'Social Studies': 4
+        }
+
+        target_subject = subject_map.get(subject)
+        if not target_subject:
+            return (None, None)  # Unknown subject
+
+        # Find matching section from LPC roster
+        for section in lpc_sections:
+            if section.get('subject_area') == target_subject:
+                return (section.get('section_id'), section)
+
+        return (None, None)
+
     def extract_illuminate_assessment_data(self,
                                            school_ids: List[int] = None,
                                            start_date: str = None,
@@ -782,6 +868,7 @@ class IlluminateAPIExtractor:
             self._load_students_cache()
             self._load_users_cache()
             self._load_roster_cache()
+            self._load_lpc_roster_cache()  # Load LPC roster for teacher matching
 
             # Extract from the correct standards-based endpoint
             logger.info("\n" + "=" * 60)
@@ -913,21 +1000,7 @@ class IlluminateAPIExtractor:
                 logger.debug(f"Skipping record for student {local_student_id} - no SchoolID found")
                 return (False, False)
 
-            # Enrich with teacher data from roster and users caches
-            roster_info = self.roster_cache.get(str(local_student_id), {})
-            teacher_id = roster_info.get('user_id')
-
-            # Get teacher info from users cache
-            teacher_info = self.users_cache.get(str(teacher_id), {}) if teacher_id else {}
-            teacher_first_name = teacher_info.get('first_name')
-            teacher_last_name = teacher_info.get('last_name')
-
-            # Use grade level from roster if not in student enrollment
-            if not student_grade and roster_info.get('grade_level_id'):
-                # Convert grade_level_id to actual grade
-                student_grade = self._convert_grade_level_id(roster_info.get('grade_level_id'))
-
-            # Extract Subject from StandardCodingNumber
+            # Extract Subject from StandardCodingNumber FIRST (needed for teacher matching)
             # Examples: "ELA-Literacy.RL.3.5" -> "ELA", "Math.1.OA.1" -> "Math"
             standard_code = result.get('standard_code', '')
             subject = None
@@ -958,6 +1031,36 @@ class IlluminateAPIExtractor:
                 # Check for Math
                 elif 'math' in assignment_lower:
                     subject = 'Math'
+
+            # Match section based on assessment subject using LPC_StudentRoster
+            section_id, section_info = self._match_section_for_assessment(local_student_id, subject)
+
+            if section_info:
+                # Use teacher from matched LPC section
+                teacher_first_name = section_info.get('teacher_first')
+                teacher_last_name = section_info.get('teacher_last')
+            else:
+                # Fallback to first roster entry from Illuminate API if no LPC match
+                roster_entries = self.roster_cache.get(str(local_student_id), [])
+                if roster_entries:
+                    roster_info = roster_entries[0] if isinstance(roster_entries, list) else roster_entries
+                    section_id = roster_info.get('section_id')
+                    teacher_id = roster_info.get('user_id')
+                    teacher_info = self.users_cache.get(str(teacher_id), {}) if teacher_id else {}
+                    teacher_first_name = teacher_info.get('first_name')
+                    teacher_last_name = teacher_info.get('last_name')
+                else:
+                    section_id = None
+                    teacher_first_name = None
+                    teacher_last_name = None
+
+            # Use grade level from roster if not in student enrollment
+            roster_entries = self.roster_cache.get(str(local_student_id), [])
+            if not student_grade and roster_entries:
+                roster_info = roster_entries[0] if isinstance(roster_entries, list) else roster_entries
+                if roster_info.get('grade_level_id'):
+                    # Convert grade_level_id to actual grade
+                    student_grade = self._convert_grade_level_id(roster_info.get('grade_level_id'))
 
             # Infer StandardSet from StandardCodingNumber prefix
             # CCSS.* = Common Core State Standards (NGA/CCSSO)
@@ -1048,7 +1151,8 @@ class IlluminateAPIExtractor:
                         PointsAchieved = ?,
                         PointsPossible = ?,
                         PercentCorrect = ?,
-                        SchoolID = ?
+                        SchoolID = ?,
+                        SectionID = ?
                     WHERE StudentID_LASID = ?
                     AND AssessmentID = ?
                     AND StandardCodingNumber = ?
@@ -1078,6 +1182,7 @@ class IlluminateAPIExtractor:
                     self._safe_decimal(result.get('points_possible')),
                     self._calculate_percent(result.get('points'), result.get('points_possible')),
                     site_id,
+                    section_id,  # Added SectionID
                     # WHERE clause parameters
                     local_student_id,
                     result.get('assessment_id'),
@@ -1125,9 +1230,9 @@ class IlluminateAPIExtractor:
                     ClassName, TeacherLastName, TeacherFirstName, ClassGrade,
                     Subject, ProgramName, Publisher, Component, AssignmentName,
                     AssessmentID, DateCompleted, StandardSet, StandardCodingNumber, StandardDescription,
-                    PointsAchieved, PointsPossible, PercentCorrect, SchoolID
+                    PointsAchieved, PointsPossible, PercentCorrect, SchoolID, SectionID
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
 
             values = (
@@ -1140,8 +1245,8 @@ class IlluminateAPIExtractor:
                 result.get('first_name'),
                 student_grade,  # Enriched from cache
                 None,  # Class name not in response
-                teacher_last_name,  # Enriched from roster/users cache
-                teacher_first_name,  # Enriched from roster/users cache
+                teacher_last_name,  # Enriched from LPC roster or fallback
+                teacher_first_name,  # Enriched from LPC roster or fallback
                 None,  # Class grade not in response
                 subject,  # Extracted from StandardCodingNumber
                 None,  # Program name not in response
@@ -1156,7 +1261,8 @@ class IlluminateAPIExtractor:
                 self._safe_decimal(result.get('points')),
                 self._safe_decimal(result.get('points_possible')),
                 self._calculate_percent(result.get('points'), result.get('points_possible')),
-                site_id  # Enriched from cache
+                site_id,  # Enriched from cache
+                section_id  # Added SectionID from LPC roster match
             )
 
             # Execute INSERT with retry logic
