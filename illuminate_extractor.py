@@ -42,6 +42,9 @@ class IlluminateAPIExtractor:
         self.users_cache = {}  # Cache for user/teacher information
         self.roster_cache = {}  # Cache for student-teacher assignments (ALL sections per student)
         self.lpc_roster_cache = {}  # Cache for LPC_StudentRoster (student->section->teacher)
+        self.subject_content_map = {}  # Cache for Module_MonthAssignment (subject->valid ContentArea IDs)
+        self.section_lookup_index = {}  # Fast O(1) lookup: (student_id, subject_area, content_area) -> section_info
+        self.subject_sa_map = {}  # Pre-computed subject abbreviation -> {sa_code, content_areas}
         self._setup_oauth()
 
     def _load_config(self, config_file: str) -> configparser.ConfigParser:
@@ -230,7 +233,9 @@ class IlluminateAPIExtractor:
                     TeacherFirst,
                     TeacherLast,
                     SubjectArea,
-                    GradeLevel
+                    GradeLevel,
+                    ContentArea,
+                    course_name
                 FROM LPC_StudentRoster
             """)
 
@@ -247,14 +252,111 @@ class IlluminateAPIExtractor:
                     'teacher_first': row[2],
                     'teacher_last': row[3],
                     'subject_area': row[4],  # 1=ELA, 2=Math, 3=Science, 4=Social Studies
-                    'grade_level': row[5]
+                    'grade_level': row[5],
+                    'content_area': row[6],
+                    'course_name': row[7]
                 })
 
             cursor.close()
             logger.info(f"Loaded LPC roster for {len(self.lpc_roster_cache)} students")
 
+            # Build fast lookup index: (student_id, subject_area, content_area) -> section_info
+            # This eliminates need to loop through sections for each assessment record
+            logger.info("Building section lookup index for O(1) teacher matching...")
+            index_count = 0
+            for student_id, sections in self.lpc_roster_cache.items():
+                for section in sections:
+                    subject_area = section.get('subject_area')
+                    content_area = section.get('content_area')
+
+                    # Create lookup key: (student_id: str, subject_area: int, content_area: int)
+                    # IMPORTANT: student_id is already str, subject_area and content_area are int from SQL
+                    if subject_area is not None and content_area is not None:
+                        key = (student_id, subject_area, content_area)
+                        # Store first matching section (students shouldn't have duplicate SA+CA combos)
+                        if key not in self.section_lookup_index:
+                            self.section_lookup_index[key] = section
+                            index_count += 1
+
+            logger.info(f"Built section lookup index with {index_count} unique (student, subject, content) combinations")
+
         except Exception as e:
             logger.error(f"Error loading LPC_StudentRoster cache: {e}")
+
+    def _load_subject_content_mapping(self):
+        """
+        Load Module_MonthAssignment from LessonPlanProduction database.
+        Creates a mapping of Subject -> (SACode, List of valid ContentArea IDs).
+
+        This determines which ContentArea values in LPC_StudentRoster are valid for each subject.
+        For example: ELA -> SACode=1, ContentArea IN (1,2,3,4,28-36)
+        """
+        if not self.db_connection:
+            logger.warning("Database not connected. Cannot load Module_MonthAssignment.")
+            return
+
+        logger.info("Loading Module_MonthAssignment from LessonPlan_Production database...")
+
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute("""
+                SELECT DISTINCT
+                    Subject_Area,
+                    SACode,
+                    courseIDCode
+                FROM LessonPlan_Production.dbo.Module_MonthAssignment
+                ORDER BY Subject_Area, SACode, courseIDCode
+            """)
+
+            for row in cursor.fetchall():
+                subject_area = row[0]  # e.g., "English Language Arts", "Mathematics"
+                sa_code = row[1]  # e.g., 1, 2, 3, 4
+                course_id_code = row[2]  # e.g., 28, 34, etc.
+
+                if subject_area not in self.subject_content_map:
+                    self.subject_content_map[subject_area] = {
+                        'sa_code': sa_code,
+                        'content_areas': []
+                    }
+
+                # Add this ContentArea ID to the list of valid ones for this subject
+                if course_id_code not in self.subject_content_map[subject_area]['content_areas']:
+                    self.subject_content_map[subject_area]['content_areas'].append(course_id_code)
+
+            cursor.close()
+
+            # Log what we loaded
+            for subject, data in self.subject_content_map.items():
+                logger.info(f"  {subject}: SACode={data['sa_code']}, ContentAreas={len(data['content_areas'])} values")
+
+            logger.info(f"Loaded {len(self.subject_content_map)} subject mappings from Module_MonthAssignment")
+
+            # Pre-compute subject abbreviation mappings for fast O(1) lookup during extraction
+            # Instead of doing this mapping 179,000 times, we do it once here
+            logger.info("Pre-computing subject abbreviation mappings for fast lookup...")
+
+            # Map common assessment subject abbreviations to their full names
+            subject_name_to_key = {
+                'ELA': 'English Language Arts',
+                'English': 'English Language Arts',
+                'Math': 'Mathematics',
+                'Mathematics': 'Mathematics',
+                'Science': 'Science',
+                'Social Studies': 'Social Studies'
+            }
+
+            for subject_abbrev, subject_full in subject_name_to_key.items():
+                if subject_full in self.subject_content_map:
+                    # Store the SA code and list of valid ContentArea IDs for this subject
+                    self.subject_sa_map[subject_abbrev] = {
+                        'sa_code': self.subject_content_map[subject_full]['sa_code'],
+                        'content_areas': self.subject_content_map[subject_full]['content_areas']
+                    }
+
+            logger.info(f"Pre-computed {len(self.subject_sa_map)} subject abbreviation mappings")
+
+        except Exception as e:
+            logger.error(f"Error loading Module_MonthAssignment: {e}")
 
     def connect_db(self):
         """Connect to SQL Server database"""
@@ -778,43 +880,74 @@ class IlluminateAPIExtractor:
 
     def _match_section_for_assessment(self, student_id: str, subject: str) -> Tuple[Optional[str], Optional[Dict]]:
         """
-        Find the correct section for a student based on assessment subject.
-        Uses LPC_StudentRoster table to match by SubjectArea.
+        OPTIMIZED: Fast O(1) lookup using pre-built section_lookup_index.
 
-        Subject mapping:
-        - 'ELA' or 'English' -> SubjectArea = 1
-        - 'Math' or 'Mathematics' -> SubjectArea = 2
-        - 'Science' -> SubjectArea = 3
-        - 'Social Studies' -> SubjectArea = 4
+        Find the correct section for a student based on assessment subject.
+        Uses pre-computed subject_sa_map to get SACode and valid ContentArea IDs,
+        then does O(1) hash lookup instead of looping through sections.
+
+        Subject mapping (pre-computed from Module_MonthAssignment):
+        - 'ELA' or 'English' -> SACode=1, ContentArea IN (1,2,3,4,28-36)
+        - 'Math' or 'Mathematics' -> SACode=2, ContentArea IN (34,...)
+        - 'Science' -> SACode=3
+        - 'Social Studies' -> SACode=4
+
+        This ensures we match "Common Core ELA" (ContentArea=28) but NOT "Reading Foundations" (ContentArea=37).
 
         Returns:
             Tuple of (section_id, section_info_dict) or (None, None) if not found
         """
-        lpc_sections = self.lpc_roster_cache.get(str(student_id), [])
-
-        if not lpc_sections:
+        if not subject:
             return (None, None)
 
-        # Map assessment subject to SubjectArea code
-        subject_map = {
-            'ELA': 1,
-            'English': 1,
-            'Math': 2,
-            'Mathematics': 2,
-            'Science': 3,
-            'Social Studies': 4
-        }
+        # Use pre-computed subject mapping (already done at startup)
+        subject_data = self.subject_sa_map.get(subject)
+        if not subject_data:
+            logger.debug(f"Unknown subject '{subject}', cannot match section")
+            return (None, None)
 
-        target_subject = subject_map.get(subject)
-        if not target_subject:
-            return (None, None)  # Unknown subject
+        target_sa_code = subject_data['sa_code']  # int
+        valid_content_areas = subject_data['content_areas']  # list of int
 
-        # Find matching section from LPC roster
-        for section in lpc_sections:
-            if section.get('subject_area') == target_subject:
+        # Try each valid ContentArea with O(1) hash lookup
+        # Key format: (student_id: str, subject_area: int, content_area: int)
+        # IMPORTANT: This must match the key format used when building the index (line 275)
+        for content_area in valid_content_areas:
+            key = (str(student_id), target_sa_code, content_area)
+            section = self.section_lookup_index.get(key)
+
+            if section:
+                course_name = section.get('course_name', 'N/A')
+                logger.debug(f"✓ Fast lookup matched section: SubjectArea={target_sa_code}, ContentArea={content_area}, Course='{course_name}'")
                 return (section.get('section_id'), section)
 
+        # If no match found
+        logger.debug(f"✗ No matching section found for student {student_id}, subject '{subject}'")
         return (None, None)
+
+    def _truncate_illuminate_tables(self):
+        """
+        Truncate Illuminate_Assessment_Results table for fresh extraction.
+        This removes all existing data before inserting new data.
+        """
+        if not self.db_connection:
+            logger.error("Database not connected. Cannot truncate tables.")
+            return
+
+        try:
+            cursor = self.db_connection.cursor()
+
+            logger.info("Truncating Illuminate_Assessment_Results...")
+            cursor.execute("TRUNCATE TABLE Illuminate_Assessment_Results")
+
+            self.db_connection.commit()
+            cursor.close()
+
+            logger.info("✓ Table truncated successfully - ready for fresh data")
+
+        except Exception as e:
+            logger.error(f"Error truncating tables: {e}")
+            raise
 
     def extract_illuminate_assessment_data(self,
                                            school_ids: List[int] = None,
@@ -869,6 +1002,13 @@ class IlluminateAPIExtractor:
             self._load_users_cache()
             self._load_roster_cache()
             self._load_lpc_roster_cache()  # Load LPC roster for teacher matching
+            self._load_subject_content_mapping()  # Load Module_MonthAssignment for ContentArea matching
+
+            # Truncate tables before fresh extraction
+            logger.info("\n" + "=" * 60)
+            logger.info("Truncating Illuminate_Assessment_Results table for fresh extraction...")
+            logger.info("=" * 60)
+            self._truncate_illuminate_tables()
 
             # Extract from the correct standards-based endpoint
             logger.info("\n" + "=" * 60)
@@ -900,11 +1040,9 @@ class IlluminateAPIExtractor:
         """
         Extract ALL assessment data from /Api/AssessmentAggregateStudentResponsesStandard/
         This is the CORRECT endpoint per Illuminate API documentation.
-        Updates existing records and inserts new ones.
+        Table is truncated at start, then all records are freshly inserted.
         """
         total_extracted = 0
-        total_updated = 0
-        total_inserted = 0
         total_skipped = 0
         page = 1
 
@@ -930,22 +1068,61 @@ class IlluminateAPIExtractor:
             if not results:
                 break
 
-            # Use batch insert for better performance
+            # Create ONE cursor for the entire page
+            cursor = self.db_connection.cursor()
+
+            # TIMING: Measure time spent preparing values (includes teacher matching)
+            import time as time_module
+            prepare_start = time_module.time()
+
+            # Prepare all INSERT values for batch insert (collect values, don't execute yet)
+            values_list = []
             for result in results:
-                # Save ALL results (not filtered by HMH) - returns (success, was_update)
-                success, was_update = self._process_illuminate_standards_result(result, academic_year)
-                if success:
-                    total_extracted += 1
-                    if was_update:
-                        total_updated += 1
-                    else:
-                        total_inserted += 1
+                # Prepare values tuple (returns None if skipped)
+                values = self._prepare_illuminate_standards_values(result, academic_year)
+                if values:
+                    values_list.append(values)
                 else:
                     total_skipped += 1
 
-            # Log progress every page
+            prepare_time = time_module.time() - prepare_start
+
+            # TIMING: Measure time spent on batch INSERT
+            insert_start = time_module.time()
+
+            # Batch INSERT all records with ONE database call
+            if values_list:
+                query = """
+                    INSERT INTO Illuminate_Assessment_Results (
+                        AcademicYear, DistrictName, SchoolName,
+                        StudentID_SASID, StudentID_LASID,
+                        LastName, FirstName, StudentGrade,
+                        ClassName, TeacherLastName, TeacherFirstName, ClassGrade,
+                        Subject, ProgramName, Publisher, Component, AssignmentName,
+                        AssessmentID, DateCompleted, StandardSet, StandardCodingNumber, StandardDescription,
+                        PointsAchieved, PointsPossible, PercentCorrect, SchoolID, SectionID
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+                cursor.executemany(query, values_list)
+                total_extracted += len(values_list)
+
+            insert_time = time_module.time() - insert_start
+
+            cursor.close()
+
+            # TIMING: Measure time spent on commit
+            commit_start = time_module.time()
+
+            # Batch commit after each page for performance
+            self.db_connection.commit()
+
+            commit_time = time_module.time() - commit_start
+
+            # Log progress every page WITH TIMING BREAKDOWN
             num_pages = data.get('num_pages', 1)
-            logger.info(f"Processed page {page}/{num_pages}, inserted: {total_inserted}, updated: {total_updated}, skipped: {total_skipped}")
+            logger.info(f"Processed page {page}/{num_pages}, inserted: {total_extracted}, skipped: {total_skipped}")
+            logger.info(f"  ⏱️  Timing breakdown: Prepare={prepare_time:.2f}s, INSERT={insert_time:.2f}s, COMMIT={commit_time:.2f}s, Total={prepare_time+insert_time+commit_time:.2f}s")
 
             if page >= num_pages:
                 break
@@ -954,28 +1131,26 @@ class IlluminateAPIExtractor:
             time.sleep(0.3)  # Rate limiting (reduced for faster extraction)
 
         # Log final summary
-        logger.info(f"Extraction complete - Total processed: {total_extracted}")
-        logger.info(f"  - New records inserted: {total_inserted}")
-        logger.info(f"  - Existing records updated: {total_updated}")
+        logger.info(f"Extraction complete - Total records inserted: {total_extracted}")
         if total_skipped > 0:
             logger.info(f"  - Records skipped (no SchoolID): {total_skipped}")
 
         return total_extracted
 
-    def _process_illuminate_standards_result(self, result: Dict, academic_year: str = None) -> tuple:
+    def _prepare_illuminate_standards_values(self, result: Dict, academic_year: str = None):
         """
-        Process a single standards-based result from /Api/AssessmentAggregateStudentResponsesStandard/
-        and store in Illuminate_Assessment_Results table.
+        Prepare values tuple for a single standards-based result from /Api/AssessmentAggregateStudentResponsesStandard/
+        to be inserted into Illuminate_Assessment_Results table using executemany().
+
+        Table is truncated before extraction starts, so all records are new inserts.
+
+        Args:
+            result: Assessment result data from API
+            academic_year: Optional academic year override
 
         Returns:
-            Tuple of (success: bool, was_update: bool)
-            - (True, True) if record was updated
-            - (True, False) if record was inserted
-            - (False, False) if record was skipped or failed
+            Tuple of values ready for INSERT, or None if record should be skipped
         """
-        if not self.db_connection:
-            return (False, False)
-
         try:
             # Determine academic year if not provided
             if not academic_year:
@@ -998,7 +1173,7 @@ class IlluminateAPIExtractor:
             # Skip records without a SchoolID - can't determine which school they belong to
             if not site_id:
                 logger.debug(f"Skipping record for student {local_student_id} - no SchoolID found")
-                return (False, False)
+                return None
 
             # Extract Subject from StandardCodingNumber FIRST (needed for teacher matching)
             # Examples: "ELA-Literacy.RL.3.5" -> "ELA", "Math.1.OA.1" -> "Math"
@@ -1075,167 +1250,8 @@ class IlluminateAPIExtractor:
                 if not standard_set and result.get('standard_set'):
                     standard_set = result.get('standard_set')
 
-            # Map API fields to database columns
-            # Retry logic for database operations
-            max_retries = 3
-            retry_count = 0
-            last_error = None
-
-            while retry_count < max_retries:
-                try:
-                    cursor = self.db_connection.cursor()
-
-                    # Check if this record already exists
-                    check_query = """
-                        SELECT COUNT(*) FROM Illuminate_Assessment_Results
-                        WHERE StudentID_LASID = ?
-                        AND AssessmentID = ?
-                        AND StandardCodingNumber = ?
-                        AND DateCompleted = ?
-                    """
-
-                    cursor.execute(check_query, (
-                        local_student_id,
-                        result.get('assessment_id'),
-                        result.get('standard_code'),
-                        self._parse_date(result.get('date_taken'))
-                    ))
-
-                    exists = cursor.fetchone()[0] > 0
-                    break  # Success - exit retry loop
-
-                except pyodbc.OperationalError as e:
-                    last_error = e
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        wait_time = 2 ** retry_count  # Exponential backoff: 2, 4, 8 seconds
-                        logger.warning(f"Database connection error (attempt {retry_count}/{max_retries}): {e}")
-                        logger.warning(f"Reconnecting in {wait_time} seconds...")
-                        time.sleep(wait_time)
-
-                        # Try to reconnect
-                        try:
-                            if self.db_connection:
-                                self.db_connection.close()
-                            self.connect_db()
-                            logger.info("Successfully reconnected to database")
-                        except Exception as reconnect_error:
-                            logger.error(f"Failed to reconnect: {reconnect_error}")
-                    else:
-                        logger.error(f"Failed after {max_retries} attempts: {last_error}")
-                        return (False, False)
-
-            if exists:
-                # Update existing record with latest data (AssignmentName may have changed)
-                query = """
-                    UPDATE Illuminate_Assessment_Results
-                    SET
-                        AcademicYear = ?,
-                        DistrictName = ?,
-                        SchoolName = ?,
-                        StudentID_SASID = ?,
-                        LastName = ?,
-                        FirstName = ?,
-                        StudentGrade = ?,
-                        ClassName = ?,
-                        TeacherLastName = ?,
-                        TeacherFirstName = ?,
-                        ClassGrade = ?,
-                        Subject = ?,
-                        ProgramName = ?,
-                        Publisher = ?,
-                        Component = ?,
-                        AssignmentName = ?,
-                        StandardSet = ?,
-                        StandardDescription = ?,
-                        PointsAchieved = ?,
-                        PointsPossible = ?,
-                        PercentCorrect = ?,
-                        SchoolID = ?,
-                        SectionID = ?
-                    WHERE StudentID_LASID = ?
-                    AND AssessmentID = ?
-                    AND StandardCodingNumber = ?
-                    AND DateCompleted = ?
-                """
-
-                values = (
-                    academic_year,
-                    district_name,
-                    school_name,
-                    state_student_id,
-                    result.get('last_name'),
-                    result.get('first_name'),
-                    student_grade,
-                    None,  # Class name not in response
-                    teacher_last_name,
-                    teacher_first_name,
-                    None,  # Class grade not in response
-                    subject,
-                    None,  # Program name not in response
-                    None,  # Publisher not in response
-                    None,  # Component not in response
-                    result.get('title'),  # Updated assignment name
-                    standard_set,  # Inferred from standard code prefix
-                    result.get('standard_description'),
-                    self._safe_decimal(result.get('points')),
-                    self._safe_decimal(result.get('points_possible')),
-                    self._calculate_percent(result.get('points'), result.get('points_possible')),
-                    site_id,
-                    section_id,  # Added SectionID
-                    # WHERE clause parameters
-                    local_student_id,
-                    result.get('assessment_id'),
-                    result.get('standard_code'),
-                    self._parse_date(result.get('date_taken'))
-                )
-
-                # Execute UPDATE with retry logic
-                retry_count = 0
-                while retry_count < max_retries:
-                    try:
-                        cursor.execute(query, values)
-                        self.db_connection.commit()
-                        cursor.close()
-                        return (True, True)  # Successfully updated
-
-                    except pyodbc.OperationalError as e:
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            wait_time = 2 ** retry_count
-                            logger.warning(f"Database error during UPDATE (attempt {retry_count}/{max_retries}): {e}")
-                            logger.warning(f"Retrying in {wait_time} seconds...")
-                            time.sleep(wait_time)
-
-                            # Reconnect and recreate cursor
-                            try:
-                                if self.db_connection:
-                                    self.db_connection.close()
-                                self.connect_db()
-                                cursor = self.db_connection.cursor()
-                                logger.info("Reconnected, retrying UPDATE")
-                            except Exception as reconnect_error:
-                                logger.error(f"Failed to reconnect: {reconnect_error}")
-                                return (False, False)
-                        else:
-                            logger.error(f"UPDATE failed after {max_retries} attempts: {e}")
-                            return (False, False)
-
-            # Insert new record
-            query = """
-                INSERT INTO Illuminate_Assessment_Results (
-                    AcademicYear, DistrictName, SchoolName,
-                    StudentID_SASID, StudentID_LASID,
-                    LastName, FirstName, StudentGrade,
-                    ClassName, TeacherLastName, TeacherFirstName, ClassGrade,
-                    Subject, ProgramName, Publisher, Component, AssignmentName,
-                    AssessmentID, DateCompleted, StandardSet, StandardCodingNumber, StandardDescription,
-                    PointsAchieved, PointsPossible, PercentCorrect, SchoolID, SectionID
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """
-
-            values = (
+            # Return values tuple for batch INSERT with executemany()
+            return (
                 academic_year,
                 district_name,  # Enriched from cache
                 school_name,  # Enriched from cache
@@ -1265,41 +1281,10 @@ class IlluminateAPIExtractor:
                 section_id  # Added SectionID from LPC roster match
             )
 
-            # Execute INSERT with retry logic
-            retry_count = 0
-            while retry_count < max_retries:
-                try:
-                    cursor.execute(query, values)
-                    self.db_connection.commit()
-                    cursor.close()
-                    return (True, False)  # Successfully inserted
-
-                except pyodbc.OperationalError as e:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        wait_time = 2 ** retry_count
-                        logger.warning(f"Database error during INSERT (attempt {retry_count}/{max_retries}): {e}")
-                        logger.warning(f"Retrying in {wait_time} seconds...")
-                        time.sleep(wait_time)
-
-                        # Reconnect and recreate cursor
-                        try:
-                            if self.db_connection:
-                                self.db_connection.close()
-                            self.connect_db()
-                            cursor = self.db_connection.cursor()
-                            logger.info("Reconnected, retrying INSERT")
-                        except Exception as reconnect_error:
-                            logger.error(f"Failed to reconnect: {reconnect_error}")
-                            return (False, False)
-                    else:
-                        logger.error(f"INSERT failed after {max_retries} attempts: {e}")
-                        return (False, False)
-
-        except pyodbc.Error as e:
-            logger.error(f"Failed to save Illuminate standards result: {e}")
+        except Exception as e:
+            logger.error(f"Failed to prepare Illuminate standards values: {e}")
             logger.error(f"Result data: {json.dumps(result, indent=2)}")
-            return (False, False)  # Failed to save
+            return None  # Skip this record
 
     def _extract_illuminate_from_standards_endpoint(self,
                                                     school_ids: List[int] = None,
