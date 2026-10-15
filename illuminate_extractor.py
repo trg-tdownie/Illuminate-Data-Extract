@@ -2203,14 +2203,15 @@ class IlluminateAPIExtractor:
     def _determine_academic_year(self, date_str: str) -> str:
         """
         Determine academic year from a date.
-        Academic year runs from July to June (e.g., 2024-07-01 to 2025-06-30 is '2024-2025')
+        Rolls over on 7 August (e.g., 2024-08-07 to 2025-08-06 is '2024-2025'),
+        matching the dashboard's school-year picker (services/school_year.py).
         """
         if not date_str:
             return None
 
         try:
             date = datetime.strptime(date_str[:10], '%Y-%m-%d')
-            if date.month >= 7:
+            if (date.month, date.day) >= (8, 7):
                 return f"{date.year}-{date.year + 1}"
             else:
                 return f"{date.year - 1}-{date.year}"

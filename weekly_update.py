@@ -298,26 +298,21 @@ class WeeklyUpdater:
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
 
-        # Determine academic year
-        current_month = datetime.now().month
-        current_year = datetime.now().year
-        if current_month >= 7:  # July onwards
-            academic_year = f"{current_year}-{current_year + 1}"
-        else:  # January to June
-            academic_year = f"{current_year - 1}-{current_year}"
-
         print(f"Date Range: {start_date} to {end_date} ({days_back} days)")
-        print(f"Academic Year: {academic_year}")
+        print("Academic Year: from each result's date taken")
         print("=" * 80)
         print()
 
-        # Step 1: Extract recent assessment data
+        # Step 1: Extract recent assessment data.
+        # No academic_year is passed, so the extractor works it out per row from
+        # date_taken. Passing today's year stamped it on every row: the table is
+        # truncated and fully reloaded each run, so a whole prior year's results
+        # all came out labelled with the current year.
         logger.info("STEP 1/4: Extracting recent assessment data...")
         total_records = self.extractor.extract_illuminate_assessment_data(
             school_ids=None,
             start_date=start_date,
             end_date=end_date,
-            academic_year=academic_year
         )
         logger.info(f"Extracted {total_records} assessment records")
         print()
