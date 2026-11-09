@@ -21,20 +21,17 @@ def main():
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
 
-    # Determine academic year
-    current_month = datetime.now().month
-    current_year = datetime.now().year
-    if current_month >= 7:  # July onwards
-        academic_year = f"{current_year}-{current_year + 1}"
-    else:  # January to June
-        academic_year = f"{current_year - 1}-{current_year}"
+    # Reload the current school year only. This used to work out a year here (rolling over on
+    # 1 July) and pass it as the label for EVERY row, which stamped it on prior years' results.
+    # The extractor now labels each row by its own date and leaves other years alone.
+    school_year = extractor.current_school_year()
 
     print("=" * 80)
     print("Illuminate Assessment Data Incremental Extractor")
     print("=" * 80)
     print(f"Extracting data from the last {days_back} days")
     print(f"Date Range: {start_date} to {end_date}")
-    print(f"Academic Year: {academic_year}")
+    print(f"School Year: {school_year}")
     print("=" * 80)
 
     # Run incremental extraction
@@ -42,7 +39,7 @@ def main():
         school_ids=None,
         start_date=start_date,
         end_date=end_date,
-        academic_year=academic_year
+        school_year=school_year
     )
 
     print("=" * 80)

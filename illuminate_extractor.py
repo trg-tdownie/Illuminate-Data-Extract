@@ -43,8 +43,16 @@ class IlluminateAPIExtractor:
         self.roster_cache = {}  # Cache for student-teacher assignments (ALL sections per student)
         self.lpc_roster_cache = {}  # Cache for LPC_StudentRoster (student->section->teacher)
         self.subject_content_map = {}  # Cache for Module_MonthAssignment (subject->valid ContentArea IDs)
-        self.section_lookup_index = {}  # Fast O(1) lookup: (student_id, subject_area, content_area) -> section_info
+        self.section_lookup_index = {}  # Fast O(1) lookup: (student_id, subject_area, content_area, school_year) -> section_info
         self.subject_sa_map = {}  # Pre-computed subject abbreviation -> {sa_code, content_areas}
+        # Past-year enrichment, loaded only when reloading a closed school year (see
+        # extract_illuminate_assessment_data). The caches above describe students as they are
+        # TODAY, which is wrong for any earlier year's tests.
+        self.past_roster_index = {}  # (student_id, subject_area, content_area) -> [section rows]
+        self.past_school_by_student = {}  # student_id -> the school they were enrolled at that year
+        self.past_grades = {}  # state student id (UIC) -> grade that year
+        self._skipped_other_year = 0
+        self._past_school_fallbacks = 0
         self._setup_oauth()
 
     def _load_config(self, config_file: str) -> configparser.ConfigParser:
@@ -235,13 +243,15 @@ class IlluminateAPIExtractor:
                     SubjectArea,
                     GradeLevel,
                     ContentArea,
-                    course_name
+                    course_name,
+                    TermID
                 FROM LPC_StudentRoster
             """)
 
             for row in cursor.fetchall():
                 student_id = str(row[0])
                 section_id = str(row[1])
+                school_year = self._school_year_from_term_id(row[8])
 
                 # Store by student ID - each student can have multiple sections
                 if student_id not in self.lpc_roster_cache:
@@ -254,34 +264,131 @@ class IlluminateAPIExtractor:
                     'subject_area': row[4],  # 1=ELA, 2=Math, 3=Science, 4=Social Studies
                     'grade_level': row[5],
                     'content_area': row[6],
-                    'course_name': row[7]
+                    'course_name': row[7],
+                    'school_year': school_year
                 })
 
             cursor.close()
             logger.info(f"Loaded LPC roster for {len(self.lpc_roster_cache)} students")
 
-            # Build fast lookup index: (student_id, subject_area, content_area) -> section_info
-            # This eliminates need to loop through sections for each assessment record
+            # Build fast lookup index: (student_id, subject_area, content_area, school_year) -> section_info
+            # This eliminates need to loop through sections for each assessment record.
+            # The school year is part of the key so a test only ever matches a section from its
+            # own year; without it a prior-year section could win for every year's tests.
             logger.info("Building section lookup index for O(1) teacher matching...")
             index_count = 0
             for student_id, sections in self.lpc_roster_cache.items():
                 for section in sections:
                     subject_area = section.get('subject_area')
                     content_area = section.get('content_area')
+                    school_year = section.get('school_year')
 
-                    # Create lookup key: (student_id: str, subject_area: int, content_area: int)
+                    # Create lookup key: (student_id: str, subject_area: int, content_area: int, school_year: str)
                     # IMPORTANT: student_id is already str, subject_area and content_area are int from SQL
-                    if subject_area is not None and content_area is not None:
-                        key = (student_id, subject_area, content_area)
-                        # Store first matching section (students shouldn't have duplicate SA+CA combos)
+                    if subject_area is not None and content_area is not None and school_year:
+                        key = (student_id, subject_area, content_area, school_year)
+                        # Store first matching section (students shouldn't have duplicate SA+CA combos in a year)
                         if key not in self.section_lookup_index:
                             self.section_lookup_index[key] = section
                             index_count += 1
 
-            logger.info(f"Built section lookup index with {index_count} unique (student, subject, content) combinations")
+            logger.info(f"Built section lookup index with {index_count} unique (student, subject, content, year) combinations")
 
         except Exception as e:
             logger.error(f"Error loading LPC_StudentRoster cache: {e}")
+
+    def _load_past_year_roster(self, school_year: str) -> bool:
+        """
+        Load a closed school year's roster from dbo.Illuminate_PastYearRoster (a view over
+        All_Enrollment / All_Section / All_Teacher, created by the dashboard migration
+        2026-11-09_illuminate_past_year_enrichment.sql).
+
+        LPC_StudentRoster only ever holds the current year, so it can't place last year's tests.
+        The repair migration applies the same rule in SQL; keep the two in step.
+
+        Returns False if the view is missing or has nothing for the year, so the caller can stop
+        before deleting that year's rows.
+        """
+        if not self.db_connection:
+            return False
+
+        logger.info(f"Loading {school_year} roster from Illuminate_PastYearRoster...")
+        self.past_roster_index = {}
+        school_counts = {}
+
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute("""
+                SELECT StudentID, SchoolID, SectionID, SubjectArea, ContentArea, TermID, PIC_Num,
+                       TeacherFirst, TeacherLast, TermStart, TermEnd
+                FROM dbo.Illuminate_PastYearRoster
+                WHERE SchoolYear = ?
+            """, school_year)
+
+            for row in cursor.fetchall():
+                student_id = str(row[0])
+                school_id = str(row[1]) if row[1] is not None else None
+                if school_id:
+                    counts = school_counts.setdefault(student_id, {})
+                    counts[school_id] = counts.get(school_id, 0) + 1
+
+                if row[3] is None or row[4] is None:
+                    continue
+                key = (student_id, row[3], row[4])
+                self.past_roster_index.setdefault(key, []).append({
+                    'section_id': str(row[2]) if row[2] is not None else None,
+                    'school_id': school_id,
+                    'content_area': row[4],
+                    'term_id': row[5],
+                    'pic_num': row[6],
+                    'teacher_first': row[7],
+                    'teacher_last': row[8],
+                    'term_start': row[9].isoformat() if row[9] else None,
+                    'term_end': row[10].isoformat() if row[10] else None,
+                })
+            cursor.close()
+        except Exception as e:
+            logger.error(f"Error loading Illuminate_PastYearRoster for {school_year}: {e}")
+            return False
+
+        # The school a student was at that year: where most of their enrollments were. Ties go to
+        # the lowest SchoolID, the same as the repair migration's ORDER BY COUNT(*) DESC, SchoolID.
+        self.past_school_by_student = {
+            student_id: min(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+            for student_id, counts in school_counts.items()
+        }
+
+        logger.info(f"Loaded {school_year} roster for {len(self.past_school_by_student)} students "
+                    f"({len(self.past_roster_index)} student/subject/content combinations)")
+        return bool(self.past_school_by_student)
+
+    def _load_past_year_grades(self, school_year: str) -> bool:
+        """
+        Each student's grade in a closed school year, from FiveYearGradeLevel (keyed by the
+        state id, which is what StudentID_SASID holds). The Illuminate enrollment API only knows
+        the grade a student is in now.
+        """
+        if not self.db_connection:
+            return False
+
+        self.past_grades = {}
+        try:
+            cursor = self.db_connection.cursor()
+            # Ordered so the first row per student wins, matching the migration's TOP 1 ... ORDER BY Grade_Level.
+            cursor.execute("""
+                SELECT UIC, Grade_Level FROM FiveYearGradeLevel
+                WHERE YearID = ? AND UIC IS NOT NULL
+                ORDER BY UIC, Grade_Level
+            """, self._term_century(school_year))
+            for uic, grade in cursor.fetchall():
+                self.past_grades.setdefault(str(uic), self._grade_from_five_year(grade))
+            cursor.close()
+        except Exception as e:
+            logger.error(f"Error loading FiveYearGradeLevel for {school_year}: {e}")
+            return False
+
+        logger.info(f"Loaded {school_year} grades for {len(self.past_grades)} students")
+        return bool(self.past_grades)
 
     def _load_subject_content_mapping(self):
         """
@@ -878,11 +985,13 @@ class IlluminateAPIExtractor:
     # These methods extract ALL Illuminate assessment data to Illuminate_* tables
     # Then HMH data can be filtered/synced to HMH_* tables using sp_Sync_HMH_Data
 
-    def _match_section_for_assessment(self, student_id: str, subject: str) -> Tuple[Optional[str], Optional[Dict]]:
+    def _match_section_for_assessment(self, student_id: str, subject: str,
+                                      school_year: str) -> Tuple[Optional[str], Optional[Dict]]:
         """
         OPTIMIZED: Fast O(1) lookup using pre-built section_lookup_index.
 
-        Find the correct section for a student based on assessment subject.
+        Find the correct section for a student based on assessment subject, from the school
+        year the test was taken in (e.g. '2025-2026'). A test with no year matches nothing.
         Uses pre-computed subject_sa_map to get SACode and valid ContentArea IDs,
         then does O(1) hash lookup instead of looping through sections.
 
@@ -897,7 +1006,7 @@ class IlluminateAPIExtractor:
         Returns:
             Tuple of (section_id, section_info_dict) or (None, None) if not found
         """
-        if not subject:
+        if not subject or not school_year:
             return (None, None)
 
         # Use pre-computed subject mapping (already done at startup)
@@ -910,10 +1019,10 @@ class IlluminateAPIExtractor:
         valid_content_areas = subject_data['content_areas']  # list of int
 
         # Try each valid ContentArea with O(1) hash lookup
-        # Key format: (student_id: str, subject_area: int, content_area: int)
-        # IMPORTANT: This must match the key format used when building the index (line 275)
+        # Key format: (student_id: str, subject_area: int, content_area: int, school_year: str)
+        # IMPORTANT: This must match the key format used when building the index (_load_lpc_roster_cache)
         for content_area in valid_content_areas:
-            key = (str(student_id), target_sa_code, content_area)
+            key = (str(student_id), target_sa_code, content_area, school_year)
             section = self.section_lookup_index.get(key)
 
             if section:
@@ -922,59 +1031,112 @@ class IlluminateAPIExtractor:
                 return (section.get('section_id'), section)
 
         # If no match found
-        logger.debug(f"✗ No matching section found for student {student_id}, subject '{subject}'")
+        logger.debug(f"✗ No matching section found for student {student_id}, subject '{subject}', year {school_year}")
         return (None, None)
 
-    def _truncate_illuminate_tables(self):
+    def _match_past_year_section(self, student_id: str, subject: str,
+                                 date_completed: Optional[str]) -> Optional[Dict]:
         """
-        Truncate Illuminate_Assessment_Results table for fresh extraction.
-        This removes all existing data before inserting new data.
+        The section a closed-year test belongs to, from the roster loaded by
+        _load_past_year_roster. Of the student's sections for the subject's content areas, prefer:
+          1. one whose term was in session on the test date (semester 1 vs semester 2),
+          2. a live enrollment over a dropped one (negative termID),
+          3. then lowest ContentArea, SectionID and PIC_Num, just so the choice is stable.
+        This is the ORDER BY in the repair migration; change both together.
+        """
+        if not subject:
+            return None
+        subject_data = self.subject_sa_map.get(subject)
+        if not subject_data:
+            return None
+
+        candidates = []
+        for content_area in subject_data['content_areas']:
+            candidates.extend(self.past_roster_index.get(
+                (str(student_id), subject_data['sa_code'], content_area), []))
+        if not candidates:
+            return None
+
+        def rank(section):
+            in_term = bool(date_completed and section['term_start'] and section['term_end']
+                           and section['term_start'] <= date_completed <= section['term_end'])
+            live = section['term_id'] is not None and section['term_id'] > 0
+            pic = section['pic_num']
+            # SQL sorts NULLs first.
+            return (not in_term, not live, section['content_area'], section['section_id'] or '',
+                    pic is not None, pic or '')
+
+        return min(candidates, key=rank)
+
+    def _delete_school_year(self, school_year: str):
+        """
+        Remove one school year's rows from Illuminate_Assessment_Results before reloading it.
+
+        This used to TRUNCATE the whole table and reload every year from the API. Each reload
+        enriched every row with the student's grade, school and teacher as they are today, so a
+        closed year's results were re-stamped with the current year's roster every week. Only the
+        year being reloaded is touched now.
         """
         if not self.db_connection:
-            logger.error("Database not connected. Cannot truncate tables.")
+            logger.error("Database not connected. Cannot clear the year.")
             return
 
         try:
             cursor = self.db_connection.cursor()
-
-            logger.info("Truncating Illuminate_Assessment_Results...")
-            cursor.execute("TRUNCATE TABLE Illuminate_Assessment_Results")
-
+            logger.info(f"Deleting {school_year} rows from Illuminate_Assessment_Results...")
+            cursor.execute("DELETE FROM Illuminate_Assessment_Results WHERE AcademicYear = ?", school_year)
+            deleted = cursor.rowcount
             self.db_connection.commit()
             cursor.close()
-
-            logger.info("✓ Table truncated successfully - ready for fresh data")
-
+            logger.info(f"✓ Deleted {deleted} rows - ready to reload {school_year}")
         except Exception as e:
-            logger.error(f"Error truncating tables: {e}")
+            logger.error(f"Error deleting {school_year} rows: {e}")
             raise
+
+    def current_school_year(self) -> str:
+        """The school year the calendar is in, with the same 7 August rollover as the dashboard."""
+        return self._determine_academic_year(datetime.now().strftime('%Y-%m-%d'))
 
     def extract_illuminate_assessment_data(self,
                                            school_ids: List[int] = None,
                                            start_date: str = None,
                                            end_date: str = None,
-                                           academic_year: str = None) -> int:
+                                           school_year: str = None) -> int:
         """
-        Extract ALL Illuminate assessment data (not just HMH) with standards-based scoring.
+        Reload ONE school year of Illuminate assessment data (not just HMH) with standards-based
+        scoring into Illuminate_Assessment_Results.
 
-        This is the main extraction method that saves all data to Illuminate_* tables.
-        After extraction, run sp_Sync_HMH_Data to populate HMH_* tables with filtered data.
+        The API returns every year's results on every call, so each run walks all of them and
+        keeps only the rows whose own test date falls in `school_year`; other years' rows in the
+        table are left exactly as they are.
 
-        This function tries multiple potential endpoints:
-        1. students/assessment_standards - Standards-based assessment data
-        2. students/assessments - Standard assessment results
+        The current year is enriched from the live roster (LPC_StudentRoster, the Illuminate
+        enrollment API). A closed year is enriched from that year's records instead
+        (Illuminate_PastYearRoster, FiveYearGradeLevel), so reloading it is safe.
 
         Args:
             school_ids: Optional list of school IDs to filter
             start_date: Optional start date (YYYY-MM-DD)
             end_date: Optional end date (YYYY-MM-DD)
-            academic_year: Academic year (e.g., '2024-2025')
+            school_year: The year to reload, e.g. '2025-2026'. Defaults to the current one.
 
         Returns:
             Total number of assessment records extracted
         """
+        current_year = self.current_school_year()
+        school_year = school_year or current_year
+        if not re.match(r'^\d{4}-\d{4}$', school_year) or \
+                int(school_year[5:]) != int(school_year[:4]) + 1:
+            logger.error(f"Not a school year: {school_year!r} (expected e.g. '2025-2026')")
+            return 0
+        if school_year > current_year:
+            logger.error(f"{school_year} hasn't started yet (current year is {current_year})")
+            return 0
+        is_past_year = school_year != current_year
+
         logger.info("=" * 60)
-        logger.info("Starting Illuminate assessment data extraction")
+        logger.info(f"Starting Illuminate assessment data extraction for {school_year}"
+                    f"{' (closed year)' if is_past_year else ''}")
         logger.info("=" * 60)
 
         if not self.connect_db():
@@ -982,6 +1144,8 @@ class IlluminateAPIExtractor:
             return 0
 
         total_extracted = 0
+        self._skipped_other_year = 0
+        self._past_school_fallbacks = 0
 
         try:
             # Test API connection
@@ -1001,24 +1165,37 @@ class IlluminateAPIExtractor:
             self._load_students_cache()
             self._load_users_cache()
             self._load_roster_cache()
-            self._load_lpc_roster_cache()  # Load LPC roster for teacher matching
             self._load_subject_content_mapping()  # Load Module_MonthAssignment for ContentArea matching
+            if is_past_year:
+                # Checked before anything is deleted: without these the year can't be enriched.
+                if not self._load_past_year_roster(school_year):
+                    logger.error(f"No {school_year} roster in Illuminate_PastYearRoster - nothing changed")
+                    return 0
+                if not self._load_past_year_grades(school_year):
+                    logger.error(f"No {school_year} grades in FiveYearGradeLevel - nothing changed")
+                    return 0
+            else:
+                self._load_lpc_roster_cache()  # Load LPC roster for teacher matching
 
-            # Truncate tables before fresh extraction
+            # Clear only the year being reloaded
             logger.info("\n" + "=" * 60)
-            logger.info("Truncating Illuminate_Assessment_Results table for fresh extraction...")
+            logger.info(f"Clearing {school_year} from Illuminate_Assessment_Results...")
             logger.info("=" * 60)
-            self._truncate_illuminate_tables()
+            self._delete_school_year(school_year)
 
             # Extract from the correct standards-based endpoint
             logger.info("\n" + "=" * 60)
             logger.info("Starting extraction from /Api/AssessmentAggregateStudentResponsesStandard/")
             logger.info("=" * 60)
             count = self._extract_from_standards_api(
-                school_ids, start_date, end_date, academic_year
+                school_ids, start_date, end_date, school_year, is_past_year
             )
             total_extracted += count
             logger.info(f"Extracted {count} standards-based assessment records")
+            logger.info(f"  - Records from other school years left untouched: {self._skipped_other_year}")
+            if self._past_school_fallbacks:
+                logger.warning(f"  - {self._past_school_fallbacks} records had no {school_year} enrollment; "
+                               f"their SchoolID is the student's current school")
 
             logger.info("=" * 60)
             logger.info(f"Illuminate extraction completed. Total records: {total_extracted}")
@@ -1036,11 +1213,12 @@ class IlluminateAPIExtractor:
                                     school_ids: List[int] = None,
                                     start_date: str = None,
                                     end_date: str = None,
-                                    academic_year: str = None) -> int:
+                                    school_year: str = None,
+                                    is_past_year: bool = False) -> int:
         """
-        Extract ALL assessment data from /Api/AssessmentAggregateStudentResponsesStandard/
+        Extract assessment data from /Api/AssessmentAggregateStudentResponsesStandard/
         This is the CORRECT endpoint per Illuminate API documentation.
-        Table is truncated at start, then all records are freshly inserted.
+        The year's rows are deleted at start; rows from other years are skipped.
         """
         total_extracted = 0
         total_skipped = 0
@@ -1079,7 +1257,9 @@ class IlluminateAPIExtractor:
             values_list = []
             for result in results:
                 # Prepare values tuple (returns None if skipped)
-                values = self._prepare_illuminate_standards_values(result, academic_year)
+                values = self._prepare_illuminate_standards_values(result, school_year, is_past_year)
+                if values == self._OTHER_YEAR:
+                    continue
                 if values:
                     values_list.append(values)
                 else:
@@ -1137,33 +1317,46 @@ class IlluminateAPIExtractor:
 
         return total_extracted
 
-    def _prepare_illuminate_standards_values(self, result: Dict, academic_year: str = None):
+    # Returned by _prepare_illuminate_standards_values for a row from a year that isn't being reloaded.
+    _OTHER_YEAR = 'other-year'
+
+    def _prepare_illuminate_standards_values(self, result: Dict, school_year: str,
+                                             is_past_year: bool = False):
         """
         Prepare values tuple for a single standards-based result from /Api/AssessmentAggregateStudentResponsesStandard/
         to be inserted into Illuminate_Assessment_Results table using executemany().
 
-        Table is truncated before extraction starts, so all records are new inserts.
+        The year's rows are deleted before extraction starts, so all records are new inserts.
 
         Args:
             result: Assessment result data from API
-            academic_year: Optional academic year override
+            school_year: The year being reloaded; results from any other year are skipped
+            is_past_year: Enrich from that year's records instead of the live roster
 
         Returns:
-            Tuple of values ready for INSERT, or None if record should be skipped
+            Tuple of values ready for INSERT, _OTHER_YEAR for a result from another year,
+            or None if the record should be skipped
         """
         try:
-            # Determine academic year if not provided
-            if not academic_year:
-                academic_year = self._determine_academic_year(result.get('date_taken'))
+            # Each result is labelled by its own test date, never by the run's year.
+            academic_year = self._determine_academic_year(result.get('date_taken'))
+            if academic_year != school_year:
+                self._skipped_other_year += 1
+                return self._OTHER_YEAR
 
             # Enrich with student/school data from cache
             local_student_id = result.get('local_student_id')
             student_data = self.students_cache.get(str(local_student_id), {})
             state_student_id = student_data.get('state_student_id')
+            district_name = student_data.get('district_name')
+
+            if is_past_year:
+                return self._prepare_past_year_values(result, academic_year, local_student_id,
+                                                      student_data, state_student_id, district_name)
+
             student_grade = student_data.get('grade_level')
             site_id = student_data.get('site_id')
             school_name = student_data.get('site_name')  # From Enrollment API
-            district_name = student_data.get('district_name')
 
             # Fallback to Sites cache if needed
             if not school_name and site_id:
@@ -1175,57 +1368,30 @@ class IlluminateAPIExtractor:
                 logger.debug(f"Skipping record for student {local_student_id} - no SchoolID found")
                 return None
 
-            # Extract Subject from StandardCodingNumber FIRST (needed for teacher matching)
-            # Examples: "ELA-Literacy.RL.3.5" -> "ELA", "Math.1.OA.1" -> "Math"
-            standard_code = result.get('standard_code', '')
-            subject = None
-            if standard_code:
-                if standard_code.startswith('ELA') or 'ELA-' in standard_code or '.ELA.' in standard_code:
-                    subject = 'ELA'
-                elif standard_code.startswith('Math') or 'Math.' in standard_code or '.Math.' in standard_code:
-                    subject = 'Math'
-                elif 'CCSS.ELA' in standard_code:
-                    subject = 'ELA'
-                elif 'CCSS.Math' in standard_code:
-                    subject = 'Math'
+            subject = self._subject_for_result(result)
 
-            # Fallback: Extract subject from AssignmentName if StandardCodingNumber didn't provide it
-            assignment_name = result.get('title', '')
-            if not subject and assignment_name:
-                assignment_lower = assignment_name.lower()
-
-                # Check for Science
-                if 'science' in assignment_lower or 'sci' in assignment_lower:
-                    subject = 'Science'
-                # Check for Social Studies (SS, Social, History)
-                elif assignment_name.upper().startswith('SS') or 'social' in assignment_lower or 'history' in assignment_lower:
-                    subject = 'Social Studies'
-                # Check for ELA
-                elif 'ela' in assignment_lower or 'english' in assignment_lower or 'reading' in assignment_lower:
-                    subject = 'ELA'
-                # Check for Math
-                elif 'math' in assignment_lower:
-                    subject = 'Math'
-
-            # Match section based on assessment subject using LPC_StudentRoster
-            section_id, section_info = self._match_section_for_assessment(local_student_id, subject)
+            # Match section based on assessment subject using LPC_StudentRoster, from the school
+            # year the test was taken in (by its own date, not the year passed in for the run)
+            section_id, section_info = self._match_section_for_assessment(local_student_id, subject, academic_year)
 
             if section_info:
                 # Use teacher from matched LPC section
                 teacher_first_name = section_info.get('teacher_first')
                 teacher_last_name = section_info.get('teacher_last')
             else:
-                # Fallback to first roster entry from Illuminate API if no LPC match
+                # Fallback to first roster entry from Illuminate API if no LPC match.
+                # Teacher only: the API roster has no school year, so its section could be from
+                # any year, and its section_id is Illuminate's own, not one of ours. SectionID
+                # stays NULL rather than point at a section the test wasn't taken in.
+                section_id = None
                 roster_entries = self.roster_cache.get(str(local_student_id), [])
                 if roster_entries:
                     roster_info = roster_entries[0] if isinstance(roster_entries, list) else roster_entries
-                    section_id = roster_info.get('section_id')
                     teacher_id = roster_info.get('user_id')
                     teacher_info = self.users_cache.get(str(teacher_id), {}) if teacher_id else {}
                     teacher_first_name = teacher_info.get('first_name')
                     teacher_last_name = teacher_info.get('last_name')
                 else:
-                    section_id = None
                     teacher_first_name = None
                     teacher_last_name = None
 
@@ -1237,54 +1403,143 @@ class IlluminateAPIExtractor:
                     # Convert grade_level_id to actual grade
                     student_grade = self._convert_grade_level_id(roster_info.get('grade_level_id'))
 
-            # Infer StandardSet from StandardCodingNumber prefix
-            # CCSS.* = Common Core State Standards (NGA/CCSSO)
-            # ELA-Literacy.* or Math.Content.* (no CCSS) = Michigan State Standards
-            standard_set = None
-            if standard_code:
-                if standard_code.startswith('CCSS.'):
-                    standard_set = 'Common Core State Standards'
-                elif standard_code.startswith('ELA-Literacy.') or standard_code.startswith('Math.Content.'):
-                    standard_set = 'Michigan State Standards'
-                # Try from API first (may be provided)
-                if not standard_set and result.get('standard_set'):
-                    standard_set = result.get('standard_set')
-
-            # Return values tuple for batch INSERT with executemany()
-            return (
-                academic_year,
-                district_name,  # Enriched from cache
-                school_name,  # Enriched from cache
-                state_student_id,  # Enriched from cache
-                local_student_id,
-                result.get('last_name'),
-                result.get('first_name'),
-                student_grade,  # Enriched from cache
-                None,  # Class name not in response
-                teacher_last_name,  # Enriched from LPC roster or fallback
-                teacher_first_name,  # Enriched from LPC roster or fallback
-                None,  # Class grade not in response
-                subject,  # Extracted from StandardCodingNumber
-                None,  # Program name not in response
-                None,  # Publisher not in response
-                None,  # Component not in response
-                result.get('title'),  # Assignment name = assessment title
-                result.get('assessment_id'),
-                self._parse_date(result.get('date_taken')),
-                standard_set,  # Inferred from standard code prefix
-                result.get('standard_code'),
-                result.get('standard_description'),
-                self._safe_decimal(result.get('points')),
-                self._safe_decimal(result.get('points_possible')),
-                self._calculate_percent(result.get('points'), result.get('points_possible')),
-                site_id,  # Enriched from cache
-                section_id  # Added SectionID from LPC roster match
-            )
+            return self._standards_values(result, academic_year, district_name, school_name,
+                                          state_student_id, local_student_id, student_grade,
+                                          teacher_first_name, teacher_last_name, subject,
+                                          site_id, section_id)
 
         except Exception as e:
             logger.error(f"Failed to prepare Illuminate standards values: {e}")
             logger.error(f"Result data: {json.dumps(result, indent=2)}")
             return None  # Skip this record
+
+    def _prepare_past_year_values(self, result: Dict, academic_year: str, local_student_id,
+                                  student_data: Dict, state_student_id, district_name):
+        """
+        _prepare_illuminate_standards_values for a closed school year: grade, school, section and
+        teacher come from that year's records, never from the live roster or the enrollment API,
+        which only know where each student is now. Mirrors the repair migration
+        (dashboard_backend scripts/migrations/2026-11-09_illuminate_past_year_enrichment.sql).
+        """
+        subject = self._subject_for_result(result)
+        date_completed = self._parse_date(result.get('date_taken'))
+        section = self._match_past_year_section(local_student_id, subject, date_completed)
+
+        if section:
+            section_id = section['section_id']
+            teacher_first_name = section['teacher_first']
+            teacher_last_name = section['teacher_last']
+            site_id = section['school_id']
+        else:
+            # No fallback to the API roster: it's this year's teacher. No teacher beats the wrong one.
+            section_id = teacher_first_name = teacher_last_name = None
+            site_id = self.past_school_by_student.get(str(local_student_id))
+
+        if not site_id:
+            # Not enrolled anywhere that year by our records. Keeping the row under their current
+            # school beats dropping their results; counted and logged.
+            site_id = student_data.get('site_id')
+            if site_id:
+                self._past_school_fallbacks += 1
+        if not site_id:
+            logger.debug(f"Skipping record for student {local_student_id} - no SchoolID found")
+            return None
+
+        if str(site_id) == str(student_data.get('site_id')) and student_data.get('site_name'):
+            school_name = student_data.get('site_name')
+        else:
+            school_name = self.sites_cache.get(str(site_id), {}).get('site_name')
+
+        student_grade = self.past_grades.get(str(state_student_id)) if state_student_id else None
+
+        return self._standards_values(result, academic_year, district_name, school_name,
+                                      state_student_id, local_student_id, student_grade,
+                                      teacher_first_name, teacher_last_name, subject,
+                                      site_id, section_id)
+
+    def _subject_for_result(self, result: Dict) -> Optional[str]:
+        """'ELA', 'Math', 'Science' or 'Social Studies' for an API result, or None."""
+        # Extract Subject from StandardCodingNumber FIRST (needed for teacher matching)
+        # Examples: "ELA-Literacy.RL.3.5" -> "ELA", "Math.1.OA.1" -> "Math"
+        standard_code = result.get('standard_code', '')
+        subject = None
+        if standard_code:
+            if standard_code.startswith('ELA') or 'ELA-' in standard_code or '.ELA.' in standard_code:
+                subject = 'ELA'
+            elif standard_code.startswith('Math') or 'Math.' in standard_code or '.Math.' in standard_code:
+                subject = 'Math'
+            elif 'CCSS.ELA' in standard_code:
+                subject = 'ELA'
+            elif 'CCSS.Math' in standard_code:
+                subject = 'Math'
+
+        # Fallback: Extract subject from AssignmentName if StandardCodingNumber didn't provide it
+        assignment_name = result.get('title', '')
+        if not subject and assignment_name:
+            assignment_lower = assignment_name.lower()
+
+            # Check for Science
+            if 'science' in assignment_lower or 'sci' in assignment_lower:
+                subject = 'Science'
+            # Check for Social Studies (SS, Social, History)
+            elif assignment_name.upper().startswith('SS') or 'social' in assignment_lower or 'history' in assignment_lower:
+                subject = 'Social Studies'
+            # Check for ELA
+            elif 'ela' in assignment_lower or 'english' in assignment_lower or 'reading' in assignment_lower:
+                subject = 'ELA'
+            # Check for Math
+            elif 'math' in assignment_lower:
+                subject = 'Math'
+        return subject
+
+    def _standards_values(self, result: Dict, academic_year: str, district_name, school_name,
+                          state_student_id, local_student_id, student_grade,
+                          teacher_first_name, teacher_last_name, subject, site_id, section_id):
+        """The Illuminate_Assessment_Results INSERT values for one standards-based API result."""
+        # Infer StandardSet from StandardCodingNumber prefix
+        # CCSS.* = Common Core State Standards (NGA/CCSSO)
+        # ELA-Literacy.* or Math.Content.* (no CCSS) = Michigan State Standards
+        standard_code = result.get('standard_code', '')
+        standard_set = None
+        if standard_code:
+            if standard_code.startswith('CCSS.'):
+                standard_set = 'Common Core State Standards'
+            elif standard_code.startswith('ELA-Literacy.') or standard_code.startswith('Math.Content.'):
+                standard_set = 'Michigan State Standards'
+            # Try from API first (may be provided)
+            if not standard_set and result.get('standard_set'):
+                standard_set = result.get('standard_set')
+
+        # Return values tuple for batch INSERT with executemany()
+        return (
+            academic_year,
+            district_name,  # Enriched from cache
+            school_name,  # Enriched from cache
+            state_student_id,  # Enriched from cache
+            local_student_id,
+            result.get('last_name'),
+            result.get('first_name'),
+            student_grade,  # Enriched from cache
+            None,  # Class name not in response
+            teacher_last_name,  # Enriched from LPC roster or fallback
+            teacher_first_name,  # Enriched from LPC roster or fallback
+            None,  # Class grade not in response
+            subject,  # Extracted from StandardCodingNumber
+            None,  # Program name not in response
+            None,  # Publisher not in response
+            None,  # Component not in response
+            result.get('title'),  # Assignment name = assessment title
+            result.get('assessment_id'),
+            self._parse_date(result.get('date_taken')),
+            standard_set,  # Inferred from standard code prefix
+            result.get('standard_code'),
+            result.get('standard_description'),
+            self._safe_decimal(result.get('points')),
+            self._safe_decimal(result.get('points_possible')),
+            self._calculate_percent(result.get('points'), result.get('points_possible')),
+            site_id,  # Enriched from cache
+            section_id  # Added SectionID from LPC roster match
+        )
 
     def _extract_illuminate_from_standards_endpoint(self,
                                                     school_ids: List[int] = None,
@@ -2218,6 +2473,38 @@ class IlluminateAPIExtractor:
         except:
             return None
 
+    def _school_year_from_term_id(self, term_id) -> Optional[str]:
+        """
+        School year of a PowerSchool termID, e.g. 3500-3599 -> '2025-2026'.
+        Same rule as the dashboard (services/school_year.py, TERM_ID_EPOCH = 1991). termIDs
+        can be stored negative, so the sign is dropped. None if it isn't a termID.
+        """
+        try:
+            n = abs(int(term_id))
+        except (TypeError, ValueError):
+            return None
+        if not 1000 <= n <= 9999:
+            return None
+        end = n // 100 + 1991
+        return f"{end - 1}-{end}"
+
+    def _term_century(self, school_year: str) -> int:
+        """FLOOR(termID/100) for a school year: 35 for '2025-2026'. Inverse of _school_year_from_term_id."""
+        return int(school_year[5:9]) - 1991
+
+    def _grade_from_five_year(self, grade) -> Optional[str]:
+        """
+        FiveYearGradeLevel.Grade_Level (an int; 0 = kindergarten, negative = pre-K) in the form
+        StudentGrade uses: 'K', '1'..'12'. Pre-K has no StudentGrade, so None.
+        """
+        try:
+            grade = int(grade)
+        except (TypeError, ValueError):
+            return None
+        if grade < 0:
+            return None
+        return 'K' if grade == 0 else str(grade)
+
     def _convert_grade_level_id(self, grade_level_id):
         """
         Convert Illuminate's grade_level_id to actual grade number.
@@ -2301,16 +2588,17 @@ def main():
     school_ids = None  # e.g., [123, 456, 789] - Set to None to extract all schools
     start_date = '2025-09-01'  # Set your date range
     end_date = '2026-06-20'
-    academic_year = '2025-2026'  # Set your academic year
+    # The year to reload: `python3 illuminate_extractor.py 2025-2026`. Defaults to the current one.
+    school_year = sys.argv[1] if len(sys.argv) > 1 else extractor.current_school_year()
 
     print("=" * 80)
     print("Illuminate Assessment Data Extractor")
     print("=" * 80)
-    print("This extracts ALL Illuminate assessment data to Illuminate_* tables.")
+    print("This reloads one school year of Illuminate assessment data in Illuminate_* tables.")
     print("=" * 80)
     print(f"School IDs: {school_ids if school_ids else 'All schools'}")
     print(f"Date Range: {start_date} to {end_date}")
-    print(f"Academic Year: {academic_year}")
+    print(f"School Year: {school_year}")
     print("=" * 80)
 
     # Run Illuminate extraction (extracts ALL data, not just HMH)
@@ -2319,7 +2607,7 @@ def main():
         school_ids=school_ids,
         start_date=start_date,
         end_date=end_date,
-        academic_year=academic_year
+        school_year=school_year
     )
 
     print("=" * 80)

@@ -4,16 +4,16 @@ Illuminate Data Weekly Update Script
 Runs every Monday to pull the last week's data and update all tables
 
 This script:
-1. Extracts assessment data from the last 7 days
+1. Reloads the current school year's assessment results (other years are left alone)
    - Uses section-based teacher matching via LPC_StudentRoster
    - Matches students to their actual subject teacher (not homeroom)
 2. Updates Illuminate_Assignments lookup table
 3. Updates Illuminate_Standards lookup table
-4. Rebuilds Illuminate_Assessment_Summary table
+4. Rebuilds that year's rows in Illuminate_Assessment_Summary
 
 Usage:
-  python3 weekly_update.py              # Last 7 days
-  python3 weekly_update.py --days 14    # Last 14 days
+  python3 weekly_update.py                            # Current school year
+  python3 weekly_update.py --school-year 2025-2026    # Reload a closed year from its own records
 """
 
 from illuminate_extractor import IlluminateAPIExtractor
@@ -199,19 +199,22 @@ class WeeklyUpdater:
             logger.error(f"Failed to update lookup tables: {e}")
             return False
 
-    def rebuild_summary_table(self):
-        """Rebuild Illuminate_Assessment_Summary from results table."""
+    def rebuild_summary_table(self, school_year):
+        """Rebuild one school year of Illuminate_Assessment_Summary from the results table.
+
+        Only that year: the results for other years weren't reloaded, so neither are their summaries.
+        """
         if not self.db_connection:
             return False
 
         try:
             cursor = self.db_connection.cursor()
 
-            logger.info("Clearing Illuminate_Assessment_Summary...")
-            cursor.execute("TRUNCATE TABLE Illuminate_Assessment_Summary")
+            logger.info(f"Clearing {school_year} from Illuminate_Assessment_Summary...")
+            cursor.execute("DELETE FROM Illuminate_Assessment_Summary WHERE AcademicYear = ?", school_year)
             self.db_connection.commit()
 
-            logger.info("Rebuilding summary from assessment results...")
+            logger.info(f"Rebuilding {school_year} summary from assessment results...")
             cursor.execute("""
                 INSERT INTO Illuminate_Assessment_Summary (
                     AcademicYear, SchoolName,
@@ -260,6 +263,7 @@ class WeeklyUpdater:
                 FROM Illuminate_Assessment_Results
                 WHERE AssessmentID IS NOT NULL
                   AND StudentID_SASID IS NOT NULL
+                  AND AcademicYear = ?
                 GROUP BY
                     AcademicYear, SchoolName,
                     StudentID_SASID, StudentID_LASID,
@@ -276,7 +280,7 @@ class WeeklyUpdater:
                     ProgramName, Publisher, Component, AssignmentName,
                     AssessmentID, DateCompleted, SchoolID
                 ORDER BY DateCompleted, LastName, FirstName, AssignmentName
-            """)
+            """, school_year)
             summary_count = cursor.rowcount
             self.db_connection.commit()
             logger.info(f"Created {summary_count} summary records")
@@ -288,8 +292,10 @@ class WeeklyUpdater:
             logger.error(f"Failed to rebuild summary table: {e}")
             return False
 
-    def run_weekly_update(self, days_back=7):
-        """Run complete weekly update process."""
+    def run_weekly_update(self, days_back=7, school_year=None):
+        """Run complete weekly update process for one school year (default: the current one)."""
+        school_year = school_year or self.extractor.current_school_year()
+
         print("=" * 80)
         print("Illuminate Assessment Data Weekly Update")
         print("=" * 80)
@@ -299,20 +305,20 @@ class WeeklyUpdater:
         start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
 
         print(f"Date Range: {start_date} to {end_date} ({days_back} days)")
-        print("Academic Year: from each result's date taken")
+        print(f"School Year: {school_year} (each result labelled by its own date taken)")
         print("=" * 80)
         print()
 
-        # Step 1: Extract recent assessment data.
-        # No academic_year is passed, so the extractor works it out per row from
-        # date_taken. Passing today's year stamped it on every row: the table is
-        # truncated and fully reloaded each run, so a whole prior year's results
-        # all came out labelled with the current year.
-        logger.info("STEP 1/4: Extracting recent assessment data...")
+        # Step 1: Reload this school year's results.
+        # Only this year: the API returns every year's results each run, and reloading a closed
+        # year from the live roster used to stamp this year's grades, schools and teachers on
+        # last year's tests. Other years' rows are left as they are.
+        logger.info(f"STEP 1/4: Reloading {school_year} assessment data...")
         total_records = self.extractor.extract_illuminate_assessment_data(
             school_ids=None,
             start_date=start_date,
             end_date=end_date,
+            school_year=school_year,
         )
         logger.info(f"Extracted {total_records} assessment records")
         print()
@@ -331,7 +337,7 @@ class WeeklyUpdater:
 
         # Step 3: Rebuild summary table
         logger.info("STEP 3/4: Rebuilding summary table...")
-        if not self.rebuild_summary_table():
+        if not self.rebuild_summary_table(school_year):
             logger.error("Failed to rebuild summary table")
             return False
         print()
@@ -381,10 +387,16 @@ def main():
         default=7,
         help='Number of days back to extract (default: 7)'
     )
+    parser.add_argument(
+        '--school-year',
+        default=None,
+        help="School year to reload, e.g. 2025-2026 (default: the current one). "
+             "A closed year is enriched from that year's own roster and grades."
+    )
     args = parser.parse_args()
 
     updater = WeeklyUpdater()
-    success = updater.run_weekly_update(days_back=args.days)
+    success = updater.run_weekly_update(days_back=args.days, school_year=args.school_year)
     sys.exit(0 if success else 1)
 
 

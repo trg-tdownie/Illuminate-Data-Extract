@@ -6,10 +6,32 @@ The weekly update script automatically pulls new assessment data from Illuminate
 
 ## What It Does
 
-1. **Extracts** assessment data from the last 7 days (configurable)
+1. **Reloads** the current school year's rows in Illuminate_Assessment_Results. The API returns
+   every year's results on each call; rows are labelled by their own test date and only the
+   current year's are written. Earlier years are left exactly as they are.
 2. **Updates** Illuminate_Assignments lookup table with any new assignments
 3. **Updates** Illuminate_Standards lookup table with any new standards
-4. **Rebuilds** Illuminate_Assessment_Summary table from all current results
+4. **Rebuilds** the current school year's rows in Illuminate_Assessment_Summary
+
+### Why only the current year
+
+Until November 2026 every run truncated the whole table and reloaded every year. Grade and
+school came from the Illuminate enrollment API and teacher/section from LPC_StudentRoster, and
+both only describe students as they are now, so every run re-stamped last year's results with
+this year's grades, schools and teachers. See `CHANGES_2026-11-09_closed_years.md`.
+
+### Reloading a closed year
+
+```bash
+python3 weekly_update.py --school-year 2025-2026
+```
+
+A closed year is enriched from that year's own records: sections and teachers from
+`dbo.Illuminate_PastYearRoster` (a view over All_Enrollment / All_Section / All_Teacher) and
+grades from `FiveYearGradeLevel`. The view is created by the dashboard migration
+`scripts/migrations/2026-11-09_illuminate_past_year_enrichment.sql`; without it the run stops
+before deleting anything. Use this for results entered after the 7 August rollover that belong
+to the year before, which the weekly run no longer touches.
 
 ## Files
 
@@ -108,7 +130,7 @@ tail -f /home/ubuntu/Illuminate-Data-Extract/weekly_update.log
 Illuminate Assessment Data Weekly Update
 ================================================================================
 Date Range: 2026-03-24 to 2026-03-31 (7 days)
-Academic Year: 2025-2026
+School Year: 2025-2026 (each result labelled by its own date taken)
 ================================================================================
 
 2026-03-31 17:00:00,123 - INFO - STEP 1/4: Extracting recent assessment data...
@@ -177,7 +199,8 @@ python3 weekly_update.py
 
 ## Notes
 
-- The script automatically determines the current academic year
-- Summary table is always rebuilt from scratch (not incremental)
+- The script works out the current school year itself (7 August rollover, same as the dashboard)
+- Each result's AcademicYear comes from its own test date, never from the run
+- Only the reloaded year's results and summary rows are deleted and rebuilt
 - Lookup tables use MERGE statements to avoid duplicates
 - All operations are logged with timestamps
